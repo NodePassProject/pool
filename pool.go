@@ -14,6 +14,7 @@ import (
 // Pool 连接池结构体，用于管理多个网络连接
 type Pool struct {
 	mu        sync.Mutex               // 互斥锁，保护共享资源访问
+	managerMu sync.Mutex               // 连接池管理器互斥锁
 	conns     sync.Map                 // 存储连接的映射表
 	idChan    chan string              // 可用ID通道
 	tlsCode   string                   // TLS安全模式代码
@@ -99,14 +100,13 @@ func (p *Pool) ClientManager() {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	var mu sync.Mutex
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		default:
-			if !mu.TryLock() {
+			if !p.managerMu.TryLock() {
 				continue
 			}
 
@@ -176,7 +176,7 @@ func (p *Pool) ClientManager() {
 			}
 
 			p.adjustCapacity(created)
-			mu.Unlock()
+			p.managerMu.Unlock()
 			time.Sleep(p.interval)
 		}
 	}
@@ -198,6 +198,14 @@ func (p *Pool) ServerManager() {
 			if err != nil {
 				continue
 			}
+
+			// 错误过多时刷新连接池
+			p.managerMu.Lock()
+			if p.errCount >= p.Active()/2 {
+				p.Flush()
+				p.errCount = 0
+			}
+			p.managerMu.Unlock()
 
 			// 验证客户端IP（如果指定）
 			if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
