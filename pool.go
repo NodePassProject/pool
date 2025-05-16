@@ -1,4 +1,4 @@
-// Package pool 实现了一个高性能、可靠的网络连接池管理系统。
+// Package pool 实现了一个高性能、可靠的网络连接池管理系统
 package pool
 
 import (
@@ -14,7 +14,6 @@ import (
 // Pool 连接池结构体，用于管理多个网络连接
 type Pool struct {
 	mu        sync.Mutex               // 互斥锁，保护共享资源访问
-	managerMu sync.Mutex               // 连接池管理器互斥锁
 	conns     sync.Map                 // 存储连接的映射表
 	idChan    chan string              // 可用ID通道
 	tlsCode   string                   // TLS安全模式代码
@@ -23,7 +22,6 @@ type Pool struct {
 	tlsConfig *tls.Config              // TLS配置
 	dialer    func() (net.Conn, error) // 创建连接的函数
 	listener  net.Listener             // 监听器
-	errCount  int                      // 错误计数
 	capacity  int                      // 当前容量
 	minCap    int                      // 最小容量
 	maxCap    int                      // 最大容量
@@ -100,20 +98,15 @@ func (p *Pool) ClientManager() {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+	var mu sync.Mutex
 
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		default:
-			if !p.managerMu.TryLock() {
+			if !mu.TryLock() {
 				continue
-			}
-
-			// 错误过多时刷新连接池
-			if p.errCount >= p.Active()/2 {
-				p.Flush()
-				p.errCount = 0
 			}
 
 			p.adjustInterval()
@@ -176,7 +169,7 @@ func (p *Pool) ClientManager() {
 			}
 
 			p.adjustCapacity(created)
-			p.managerMu.Unlock()
+			mu.Unlock()
 			time.Sleep(p.interval)
 		}
 	}
@@ -198,14 +191,6 @@ func (p *Pool) ServerManager() {
 			if err != nil {
 				continue
 			}
-
-			// 错误过多时刷新连接池
-			p.managerMu.Lock()
-			if p.errCount >= p.Active()/2 {
-				p.Flush()
-				p.errCount = 0
-			}
-			p.managerMu.Unlock()
 
 			// 验证客户端IP（如果指定）
 			if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
@@ -323,13 +308,6 @@ func (p *Pool) Capacity() int {
 // Interval 获取当前连接创建间隔
 func (p *Pool) Interval() time.Duration {
 	return p.interval
-}
-
-// AddError 增加错误计数
-func (p *Pool) AddError() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.errCount++
 }
 
 // getID 生成唯一的连接ID

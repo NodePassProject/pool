@@ -132,9 +132,6 @@ interval := clientPool.Interval()
 
 // Manually flush all connections (rarely needed)
 clientPool.Flush()
-
-// Record an error (increases internal error counter)
-clientPool.AddError()
 ```
 
 ## Security Features
@@ -172,8 +169,21 @@ The pool supports three TLS security modes for client connections:
 
 The pool automatically adjusts:
 
-- Connection creation intervals based on idle connection count
-- Connection capacity based on connection creation success rate
+- Connection creation intervals based on idle connection count (using `adjustInterval` method)
+  - Decreases interval when pool is under-utilized (< 20% idle connections)
+  - Increases interval when pool is over-utilized (> 80% idle connections)
+  
+- Connection capacity based on connection creation success rate (using `adjustCapacity` method)
+  - Decreases capacity when success rate is low (< 20%)
+  - Increases capacity when success rate is high (> 80%)
+
+These adjustments ensure optimal resource usage:
+
+```go
+// Check current capacity and interval settings
+currentCapacity := clientPool.Capacity()
+currentInterval := clientPool.Interval()
+```
 
 ## Advanced Usage
 
@@ -187,11 +197,10 @@ import (
     "net"
     "time"
     "github.com/NodePassProject/pool"
-    "github.com/NodePassProject/logs"
 )
 
 func main() {
-    logger := logs.NewLogger(logs.Info, true)
+    logger := log.New(log.Writer(), "POOL: ", log.LstdFlags)
     
     clientPool := pool.NewClientPool(
         5, 20,
@@ -201,10 +210,7 @@ func main() {
             conn, err := net.Dial("tcp", "example.com:8080")
             if err != nil {
                 // Log the error
-                logger.Error("Connection failed: %v", err)
-                
-                // Record the error in the pool
-                clientPool.AddError()
+                logger.Printf("Connection failed: %v", err)
             }
             return conn, err
         },
@@ -251,6 +257,9 @@ func main() {
     // clientPool.Close()
 }
 ```
+
+Note: The pool internally creates and manages its own context during operation. The context 
+passed to dialers is useful for external control of connection attempts.
 
 ### Load Balancing with Multiple Pools
 
@@ -349,11 +358,12 @@ The `isActive` method checks connection health by setting a brief read deadline 
    - Increase max capacity
    - Decrease connection hold time
    - Check for connection leaks (connections not being released)
+   - Monitor dynamic capacity adjustment with `Capacity()` method
 
 4. **High Error Rate**
-   - Monitor with `AddError()`
    - Implement backoff strategy in dialer
    - Consider server-side issues
+   - Check connection validation with `isActive` method
 
 ### Debugging
 
@@ -361,8 +371,15 @@ Set log points at key locations:
 
 - Before/after dialer calls
 - When connections are added/removed from the pool
-- When pool capacity is adjusted
-- When connections are validated
+- When pool capacity is adjusted (`adjustCapacity` method) 
+- When connection intervals are adjusted (`adjustInterval` method)
+- When connections are validated with `isActive` method
+
+## Context Management
+
+The pool package uses Go's context package for proper connection lifecycle management. 
+Both `ClientManager` and `ServerManager` create a context when started, and this context 
+is cancelled when the pool is closed.
 
 ## License
 
