@@ -22,6 +22,7 @@ type Pool struct {
 	tlsConfig *tls.Config              // TLS配置
 	dialer    func() (net.Conn, error) // 创建连接的函数
 	listener  net.Listener             // 监听器
+	errCount  int                      // 错误计数
 	capacity  int                      // 当前容量
 	minCap    int                      // 最小容量
 	maxCap    int                      // 最大容量
@@ -308,6 +309,20 @@ func (p *Pool) Capacity() int {
 // Interval 获取当前连接创建间隔
 func (p *Pool) Interval() time.Duration {
 	return p.interval
+}
+
+// AddError 增加错误计数
+func (p *Pool) AddError() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errCount++
+}
+
+// ErrorCount 获取错误计数
+func (p *Pool) ErrorCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.errCount
 }
 
 // getID 生成唯一的连接ID
