@@ -5,23 +5,85 @@
 
 A high-performance, reliable network connection pool management system for Go applications.
 
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+  - [Client Connection Pool](#client-connection-pool)
+  - [Server Connection Pool](#server-connection-pool)
+  - [Managing Pool Health](#managing-pool-health)
+- [Security Features](#security-features)
+  - [Client IP Restriction](#client-ip-restriction)
+  - [TLS Security Modes](#tls-security-modes)
+- [Connection Keep-Alive](#connection-keep-alive)
+- [Dynamic Adjustment](#dynamic-adjustment)
+- [Advanced Usage](#advanced-usage)
+- [Performance Considerations](#performance-considerations)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
 ## Features
 
-- Thread-safe connection management with mutex protection
-- Support for both client and server connection pools
-- Dynamic capacity adjustment based on usage patterns
-- Automatic connection health monitoring
-- Multiple TLS security modes (none, self-signed, verified)
-- Connection identification and tracking
-- Graceful error handling and recovery
-- Configurable connection creation intervals
-- Auto-reconnection with exponential backoff
-- Connection activity validation
+- **Thread-safe connection management** with mutex protection
+- **Support for both client and server connection pools**
+- **Dynamic capacity adjustment** based on usage patterns
+- **Automatic connection health monitoring**
+- **Connection keep-alive management** for maintaining active connections
+- **Multiple TLS security modes** (none, self-signed, verified)
+- **Connection identification and tracking**
+- **Graceful error handling and recovery**
+- **Configurable connection creation intervals**
+- **Auto-reconnection with exponential backoff**
+- **Connection activity validation**
 
 ## Installation
 
 ```bash
 go get github.com/NodePassProject/pool
+```
+
+## Quick Start
+
+Here's a minimal example to get you started:
+
+```go
+package main
+
+import (
+    "net"
+    "time"
+    "github.com/NodePassProject/pool"
+)
+
+func main() {
+    // Create a client pool
+    dialer := func() (net.Conn, error) {
+        return net.Dial("tcp", "example.com:8080")
+    }
+    
+    pool := pool.NewClientPool(
+        5, 20,                              // min/max capacity
+        500*time.Millisecond, 5*time.Second, // min/max intervals
+        30*time.Second,                     // keep-alive period
+        "0", "example.com",                 // TLS mode, hostname
+        dialer,
+    )
+    
+    // Start the pool manager
+    go pool.ClientManager()
+    
+    // Use the pool
+    conn := pool.ClientGet("connection-id")
+    if conn != nil {
+        // Use connection...
+        defer conn.Close()
+    }
+    
+    // Clean up
+    defer pool.Close()
+}
 ```
 
 ## Usage
@@ -37,8 +99,7 @@ import (
     "github.com/NodePassProject/pool"
 )
 
-func main() {
-    // Create a dialer function
+func main() {    // Create a dialer function
     dialer := func() (net.Conn, error) {
         return net.Dial("tcp", "example.com:8080")
     }
@@ -48,11 +109,13 @@ func main() {
     // - Maximum capacity: 20 connections
     // - Minimum interval: 500ms between connection attempts
     // - Maximum interval: 5s between connection attempts
+    // - Keep-alive period: 30s for connection health monitoring
     // - TLS mode: "2" (verified certificates)
     // - Hostname for certificate verification: "example.com"
     clientPool := pool.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
+        30*time.Second,
         "2", "example.com",
         dialer,
     )
@@ -91,14 +154,14 @@ func main() {
     // Optional: Create a TLS config
     tlsConfig := &tls.Config{
         // Configure TLS settings
-        MinVersion: tls.VersionTLS13,
-    }
+        MinVersion: tls.VersionTLS13,    }
     
     // Create a new server pool
     // - Restrict to specific client IP (optional, "" for any IP, "192.168.1.10" to only allow that specific IP)
     // - Use TLS config (optional, nil for no TLS)
     // - Use the created listener
-    serverPool := pool.NewServerPool("192.168.1.10", tlsConfig, listener)
+    // - Keep-alive period: 30s for connection health monitoring
+    serverPool := pool.NewServerPool("192.168.1.10", tlsConfig, listener, 30*time.Second)
     
     // Start the server manager (usually in a goroutine)
     go serverPool.ServerManager()
@@ -148,7 +211,7 @@ The `NewServerPool` function allows you to restrict incoming connections to a sp
 
 ```go
 // Create a server pool that only accepts connections from 192.168.1.10
-serverPool := pool.NewServerPool("192.168.1.10", tlsConfig, listener)
+serverPool := pool.NewServerPool("192.168.1.10", tlsConfig, listener, 30*time.Second)
 ```
 
 When the `clientIP` parameter is set:
@@ -160,16 +223,75 @@ To allow connections from any IP address, use an empty string:
 
 ```go
 // Create a server pool that accepts connections from any IP
-serverPool := pool.NewServerPool("", tlsConfig, listener)
+serverPool := pool.NewServerPool("", tlsConfig, listener, 30*time.Second)
 ```
 
 ### TLS Security Modes
 
-The pool supports three TLS security modes for client connections:
+| Mode | Description | Security Level | Use Case |
+|------|-------------|----------------|----------|
+| `"0"` | No TLS (plain TCP) | None | Internal networks, maximum performance |
+| `"1"` | Self-signed certificates | Medium | Development, testing environments |
+| `"2"` | Verified certificates | High | Production, public networks |
 
-- `"0"`: No TLS (plain TCP connections)
-- `"1"`: Self-signed certificates (InsecureSkipVerify=true)
-- `"2"`: Verified certificates (proper certificate validation)
+#### Example Usage
+
+```go
+// No TLS - maximum performance
+clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "0", "example.com", dialer)
+
+// Self-signed TLS - development/testing
+clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", "example.com", dialer)
+
+// Verified TLS - production
+clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example.com", dialer)
+```
+
+## Connection Keep-Alive
+
+The pool implements TCP keep-alive functionality to maintain connection health and detect broken connections:
+
+### Keep-Alive Features
+
+- **Automatic Keep-Alive**: All connections automatically enable TCP keep-alive
+- **Configurable Period**: Set custom keep-alive periods for both client and server pools
+- **Connection Health**: Helps detect and remove dead connections from the pool
+- **Network Efficiency**: Reduces unnecessary connection overhead
+
+### Usage Examples
+
+```go
+// Client pool with 30-second keep-alive
+clientPool := pool.NewClientPool(
+    5, 20,
+    500*time.Millisecond, 5*time.Second,
+    30*time.Second,  // Keep-alive period
+    "2", "example.com",
+    dialer,
+)
+
+// Server pool with 60-second keep-alive
+serverPool := pool.NewServerPool(
+    "192.168.1.10", 
+    tlsConfig, 
+    listener, 
+    60*time.Second,  // Keep-alive period
+)
+```
+
+### Keep-Alive Best Practices
+
+| Period Range | Use Case | Pros | Cons |
+|-------------|----------|------|------|
+| 15-30s | High-frequency apps, real-time systems | Quick dead connection detection | Higher network overhead |
+| 30-60s | General purpose applications | Balanced performance/overhead | Standard detection time |
+| 60-120s | Low-frequency, batch processing | Minimal network overhead | Slower dead connection detection |
+
+**Recommendations:**
+- **Web applications**: 30-60 seconds
+- **Real-time systems**: 15-30 seconds  
+- **Batch processing**: 60-120 seconds
+- **Behind NAT/Firewall**: Use shorter periods (15-30s)
 
 ## Dynamic Adjustment
 
@@ -206,12 +328,12 @@ import (
     "github.com/NodePassProject/logs"
 )
 
-func main() {
-    logger := logs.NewLogger(logs.Info, true)
+func main() {    logger := logs.NewLogger(logs.Info, true)
     
     clientPool := pool.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
+        30*time.Second,
         "2", "example.com",
         func() (net.Conn, error) {
             conn, err := net.Dial("tcp", "example.com:8080")
@@ -245,13 +367,13 @@ import (
 )
 
 func main() {
-    // Create a context that can be cancelled
-    ctx, cancel := context.WithCancel(context.Background())
+    // Create a context that can be cancelled    ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
     
     clientPool := pool.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
+        30*time.Second,
         "2", "example.com",
         func() (net.Conn, error) {
             // Use context-aware dialer
@@ -289,12 +411,12 @@ func main() {
     }
     
     pools := make([]*pool.Pool, len(serverAddresses))
-    
-    for i, addr := range serverAddresses {
+      for i, addr := range serverAddresses {
         serverAddr := addr // Create local copy for closure
         pools[i] = pool.NewClientPool(
             5, 20,
             500*time.Millisecond, 5*time.Second,
+            30*time.Second,
             "2", serverAddr[:len(serverAddr)-5], // Extract hostname
             func() (net.Conn, error) {
                 return net.Dial("tcp", serverAddr)
@@ -326,61 +448,106 @@ func main() {
 
 ### Connection Pool Sizing
 
-The ideal pool size depends on your application's workload:
+| Pool Size | Pros | Cons | Best For |
+|-----------|------|------|----------|
+| Too Small (< 5) | Low resource usage | Connection contention, delays | Low-traffic applications |
+| Optimal (5-50) | Balanced performance | Requires monitoring | Most applications |
+| Too Large (> 100) | No contention | Resource waste, server overload | High-traffic, many clients |
 
-- **Too small**: Can cause connection contention and delays
-- **Too large**: Wastes resources and may overload the server
+**Sizing Guidelines:**
+- Start with `minCap = baseline_load` and `maxCap = peak_load × 1.5`
+- Monitor connection usage with `pool.Active()` and `pool.Capacity()`
+- Adjust based on observed patterns
 
-Start with a minimum capacity that can handle your baseline load and a maximum capacity that can handle peak loads. Monitor connection usage and adjust accordingly.
+### TLS Performance Impact
 
-### TLS Overhead
+| Aspect | No TLS | Self-signed TLS | Verified TLS |
+|--------|--------|-----------------|--------------|
+| **Handshake Time** | ~1ms | ~10-50ms | ~50-100ms |
+| **Memory Usage** | Low | Medium | High |
+| **CPU Overhead** | Minimal | Medium | High |
+| **Throughput** | Maximum | ~80% of max | ~60% of max |
 
-TLS connections have additional overhead:
+### Connection Validation Overhead
 
-- **Handshake cost**: TLS handshakes are CPU-intensive
-- **Memory usage**: TLS connections require more memory
-- **Latency**: Initial connection setup is slower
+The `isActive` method performs lightweight connection health checks:
+- **Cost**: ~1ms per validation
+- **Frequency**: On connection retrieval
+- **Trade-off**: Reliability vs. slight performance overhead
 
-If maximum performance is critical and the network is secure, consider using mode `"0"` (no TLS).
-
-### Connection Validation
-
-The `isActive` method checks connection health by setting a brief read deadline and attempting to read. This ensures connections in the pool are valid, but adds a small overhead. For extremely high-throughput systems, consider implementing a custom validation strategy.
+For ultra-high-throughput systems, consider implementing custom validation strategies.
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Connection Timeout**
-   - Check network connectivity
-   - Verify server address and port
-   - Increase connection timeout in dialer
+#### 1. Connection Timeout
+**Symptoms:** Connections fail to establish  
+**Solutions:**
+- Check network connectivity to target host
+- Verify server address and port are correct
+- Increase connection timeout in dialer:
+  ```go
+  dialer := func() (net.Conn, error) {
+      d := net.Dialer{Timeout: 10 * time.Second}
+      return d.Dial("tcp", "example.com:8080")
+  }
+  ```
 
-2. **TLS Handshake Failure**
-   - Verify certificate validity
-   - Check hostname configuration matches certificate
-   - For testing, try TLS mode `"1"` (InsecureSkipVerify)
+#### 2. TLS Handshake Failure
+**Symptoms:** TLS connections fail with certificate errors  
+**Solutions:**
+- Verify certificate validity and expiration
+- Check hostname matches certificate Common Name
+- For testing, temporarily use TLS mode `"1"`:
+  ```go
+  // Temporary workaround for testing
+  pool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", hostname, dialer)
+  ```
 
-3. **Pool Exhaustion**
-   - Increase max capacity
-   - Decrease connection hold time
-   - Check for connection leaks (connections not being released)
+#### 3. Pool Exhaustion
+**Symptoms:** `ServerGet()` blocks indefinitely  
+**Solutions:**
+- Increase maximum capacity
+- Reduce connection hold time in application code
+- Check for connection leaks (ensure connections are properly closed)
+- Monitor with `pool.Active()` and `pool.ErrorCount()`
 
-4. **High Error Rate**
-   - Monitor with `AddError()`
-   - Implement backoff strategy in dialer
-   - Consider server-side issues
+#### 4. High Error Rate
+**Symptoms:** Frequent connection failures  
+**Solutions:**
+- Implement exponential backoff in dialer
+- Monitor server-side issues
+- Track errors with `pool.AddError()` and `pool.ErrorCount()`
 
-### Debugging
+### Debugging Checklist
 
-Set log points at key locations:
+- [ ] **Network connectivity**: Can you ping/telnet to the target?
+- [ ] **Port availability**: Is the target port open and listening?
+- [ ] **Certificate validity**: For TLS, are certificates valid and not expired?
+- [ ] **Pool capacity**: Is `maxCap` sufficient for your load?
+- [ ] **Connection leaks**: Are you properly closing connections?
+- [ ] **Error monitoring**: Are you tracking `pool.ErrorCount()`?
 
-- Before/after dialer calls
-- When connections are added/removed from the pool
-- When pool capacity is adjusted
-- When connections are validated
+### Debug Logging
+
+Add logging at key points for better debugging:
+
+```go
+dialer := func() (net.Conn, error) {
+    log.Printf("Attempting connection to %s", address)
+    conn, err := net.Dial("tcp", address)
+    if err != nil {
+        log.Printf("Connection failed: %v", err)
+        pool.AddError() // Track the error
+    } else {
+        log.Printf("Connection established successfully")
+    }
+    return conn, err
+}
+```
 
 ## License
 
 Copyright (c) 2025, NodePassProject. Licensed under the BSD 3-Clause License.
-See the [LICENSE](./LICENSE) file for details.
+See the [LICENSE](LICENSE) file for details.

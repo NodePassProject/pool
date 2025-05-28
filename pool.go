@@ -29,6 +29,7 @@ type Pool struct {
 	interval  time.Duration            // 连接创建间隔
 	minIvl    time.Duration            // 最小间隔
 	maxIvl    time.Duration            // 最大间隔
+	keepAlive time.Duration            // 保活间隔
 	ctx       context.Context          // 上下文
 	cancel    context.CancelFunc       // 取消函数
 }
@@ -37,6 +38,7 @@ type Pool struct {
 func NewClientPool(
 	minCap, maxCap int,
 	minIvl, maxIvl time.Duration,
+	keepAlive time.Duration,
 	tlsCode string,
 	hostname string,
 	dialer func() (net.Conn, error),
@@ -62,22 +64,28 @@ func NewClientPool(
 	}
 
 	return &Pool{
-		conns:    sync.Map{},
-		idChan:   make(chan string, maxCap),
-		tlsCode:  tlsCode,
-		hostname: hostname,
-		dialer:   dialer,
-		capacity: minCap,
-		minCap:   minCap,
-		maxCap:   maxCap,
-		interval: minIvl,
-		minIvl:   minIvl,
-		maxIvl:   maxIvl,
+		conns:     sync.Map{},
+		idChan:    make(chan string, maxCap),
+		tlsCode:   tlsCode,
+		hostname:  hostname,
+		dialer:    dialer,
+		capacity:  minCap,
+		minCap:    minCap,
+		maxCap:    maxCap,
+		interval:  minIvl,
+		minIvl:    minIvl,
+		maxIvl:    maxIvl,
+		keepAlive: keepAlive,
 	}
 }
 
 // NewServerPool 创建新的服务器连接池
-func NewServerPool(clientIP string, tlsConfig *tls.Config, listener net.Listener) *Pool {
+func NewServerPool(
+	clientIP string,
+	tlsConfig *tls.Config,
+	listener net.Listener,
+	keepAlive time.Duration,
+) *Pool {
 	maxCap := 65536
 	if listener == nil {
 		return nil
@@ -90,6 +98,7 @@ func NewServerPool(clientIP string, tlsConfig *tls.Config, listener net.Listener
 		tlsConfig: tlsConfig,
 		listener:  listener,
 		maxCap:    maxCap,
+		keepAlive: keepAlive,
 	}
 }
 
@@ -159,6 +168,9 @@ func (p *Pool) ClientManager() {
 					continue
 				}
 
+				conn.(*net.TCPConn).SetKeepAlive(true)
+				conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
+
 				id := string(buf[:n])
 				select {
 				case p.idChan <- id:
@@ -222,6 +234,9 @@ func (p *Pool) ServerManager() {
 				conn.Close()
 				continue
 			}
+
+			conn.(*net.TCPConn).SetKeepAlive(true)
+			conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
 			select {
 			case p.idChan <- id:
