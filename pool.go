@@ -17,6 +17,7 @@ type Pool struct {
 	conns     sync.Map                 // 存储连接的映射表
 	idChan    chan string              // 可用ID通道
 	tlsCode   string                   // TLS安全模式代码
+	isSingle  bool                     // 是否单端转发
 	hostname  string                   // 主机名
 	clientIP  string                   // 客户端IP
 	tlsConfig *tls.Config              // TLS配置
@@ -40,6 +41,7 @@ func NewClientPool(
 	minIvl, maxIvl time.Duration,
 	keepAlive time.Duration,
 	tlsCode string,
+	isSingle bool,
 	hostname string,
 	dialer func() (net.Conn, error),
 ) *Pool {
@@ -67,6 +69,7 @@ func NewClientPool(
 		conns:     sync.Map{},
 		idChan:    make(chan string, maxCap),
 		tlsCode:   tlsCode,
+		isSingle:  isSingle,
 		hostname:  hostname,
 		dialer:    dialer,
 		capacity:  minCap,
@@ -129,49 +132,54 @@ func (p *Pool) ClientManager() {
 					continue
 				}
 
-				// 根据TLS代码应用不同级别的TLS安全
-				switch p.tlsCode {
-				case "0":
-					// 不使用TLS
-				case "1":
-					// 使用自签名证书（不验证）
-					tlsConn := tls.Client(conn, &tls.Config{
-						InsecureSkipVerify: true,
-						MinVersion:         tls.VersionTLS13,
-					})
-					err := tlsConn.Handshake()
-					if err != nil {
-						conn.Close()
-						continue
-					}
-					conn = tlsConn
-				case "2":
-					// 使用验证证书（安全模式）
-					tlsConn := tls.Client(conn, &tls.Config{
-						InsecureSkipVerify: false,
-						MinVersion:         tls.VersionTLS13,
-						ServerName:         p.hostname,
-					})
-					err := tlsConn.Handshake()
-					if err != nil {
-						conn.Close()
-						continue
-					}
-					conn = tlsConn
-				}
-
-				// 读取连接ID
-				buf := make([]byte, 8)
-				n, err := conn.Read(buf)
-				if err != nil || n != 8 {
-					conn.Close()
-					continue
-				}
-
 				conn.(*net.TCPConn).SetKeepAlive(true)
 				conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
-				id := string(buf[:n])
+				var id string
+				if !p.isSingle {
+					// 根据TLS代码应用不同级别的TLS安全
+					switch p.tlsCode {
+					case "0":
+						// 不使用TLS
+					case "1":
+						// 使用自签名证书（不验证）
+						tlsConn := tls.Client(conn, &tls.Config{
+							InsecureSkipVerify: true,
+							MinVersion:         tls.VersionTLS13,
+						})
+						err := tlsConn.Handshake()
+						if err != nil {
+							conn.Close()
+							continue
+						}
+						conn = tlsConn
+					case "2":
+						// 使用验证证书（安全模式）
+						tlsConn := tls.Client(conn, &tls.Config{
+							InsecureSkipVerify: false,
+							MinVersion:         tls.VersionTLS13,
+							ServerName:         p.hostname,
+						})
+						err := tlsConn.Handshake()
+						if err != nil {
+							conn.Close()
+							continue
+						}
+						conn = tlsConn
+					}
+
+					// 读取连接ID
+					buf := make([]byte, 8)
+					n, err := conn.Read(buf)
+					if err != nil || n != 8 {
+						conn.Close()
+						continue
+					}
+					id = string(buf[:n])
+				} else {
+					id = p.getID()
+				}
+
 				select {
 				case p.idChan <- id:
 					p.conns.Store(id, conn)
@@ -205,6 +213,9 @@ func (p *Pool) ServerManager() {
 				continue
 			}
 
+			conn.(*net.TCPConn).SetKeepAlive(true)
+			conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
+
 			// 验证客户端IP（如果指定）
 			if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
 				conn.Close()
@@ -235,9 +246,6 @@ func (p *Pool) ServerManager() {
 				continue
 			}
 
-			conn.(*net.TCPConn).SetKeepAlive(true)
-			conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
-
 			select {
 			case p.idChan <- id:
 				p.conns.Store(id, conn)
@@ -250,14 +258,36 @@ func (p *Pool) ServerManager() {
 
 // ClientGet 获取指定ID的客户端连接
 func (p *Pool) ClientGet(id string) net.Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if conn, ok := p.conns.LoadAndDelete(id); ok {
-		p.removeID(id)
-		return conn.(net.Conn)
+	if id == "" {
+		for {
+			select {
+			case <-p.ctx.Done():
+				return nil
+			case id := <-p.idChan:
+				if conn, ok := p.conns.LoadAndDelete(id); ok {
+					netConn := conn.(net.Conn)
+					if p.isActive(netConn) {
+						return netConn
+					}
+					netConn.Close()
+				}
+			default:
+				conn, err := p.dialer()
+				if err != nil {
+					return nil
+				}
+				return conn
+			}
+		}
+	} else {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if conn, ok := p.conns.LoadAndDelete(id); ok {
+			p.removeID(id)
+			return conn.(net.Conn)
+		}
+		return nil
 	}
-	return nil
 }
 
 // ServerGet 获取一个可用的服务器连接及其ID

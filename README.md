@@ -17,6 +17,7 @@ A high-performance, reliable network connection pool management system for Go ap
 - [Security Features](#security-features)
   - [Client IP Restriction](#client-ip-restriction)
   - [TLS Security Modes](#tls-security-modes)
+- [Connection Modes](#connection-modes)
 - [Connection Keep-Alive](#connection-keep-alive)
 - [Dynamic Adjustment](#dynamic-adjustment)
 - [Advanced Usage](#advanced-usage)
@@ -33,6 +34,7 @@ A high-performance, reliable network connection pool management system for Go ap
 - **Connection keep-alive management** for maintaining active connections
 - **Multiple TLS security modes** (none, self-signed, verified)
 - **Connection identification and tracking**
+- **Single and multi-connection modes** for different use cases
 - **Graceful error handling and recovery**
 - **Configurable connection creation intervals**
 - **Auto-reconnection with exponential backoff**
@@ -62,12 +64,13 @@ func main() {
     dialer := func() (net.Conn, error) {
         return net.Dial("tcp", "example.com:8080")
     }
-    
-    pool := pool.NewClientPool(
+      pool := pool.NewClientPool(
         5, 20,                              // min/max capacity
         500*time.Millisecond, 5*time.Second, // min/max intervals
         30*time.Second,                     // keep-alive period
-        "0", "example.com",                 // TLS mode, hostname
+        "0",                                // TLS mode
+        false,                              // isSingle mode
+        "example.com",                      // hostname
         dialer,
     )
     
@@ -103,20 +106,22 @@ func main() {    // Create a dialer function
     dialer := func() (net.Conn, error) {
         return net.Dial("tcp", "example.com:8080")
     }
-    
-    // Create a new client pool with:
+      // Create a new client pool with:
     // - Minimum capacity: 5 connections
     // - Maximum capacity: 20 connections
     // - Minimum interval: 500ms between connection attempts
     // - Maximum interval: 5s between connection attempts
     // - Keep-alive period: 30s for connection health monitoring
     // - TLS mode: "2" (verified certificates)
+    // - Single mode: false (multi-connection mode)
     // - Hostname for certificate verification: "example.com"
     clientPool := pool.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
-        "2", "example.com",
+        "2",
+        false,
+        "example.com",
         dialer,
     )
     
@@ -238,14 +243,80 @@ serverPool := pool.NewServerPool("", tlsConfig, listener, 30*time.Second)
 
 ```go
 // No TLS - maximum performance
-clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "0", "example.com", dialer)
+clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "0", false, "example.com", dialer)
 
 // Self-signed TLS - development/testing
-clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", "example.com", dialer)
+clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", false, "example.com", dialer)
 
 // Verified TLS - production
-clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example.com", dialer)
+clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", false, "example.com", dialer)
 ```
+
+## Connection Modes
+
+The pool supports two connection modes through the `isSingle` parameter:
+
+### Multi-Connection Mode (`isSingle = false`)
+
+In this mode, the pool manages multiple connections with server-generated IDs:
+
+```go
+// Multi-connection mode - server generates connection IDs
+clientPool := pool.NewClientPool(
+    5, 20,
+    500*time.Millisecond, 5*time.Second,
+    30*time.Second,
+    "2",
+    false,  // Multi-connection mode
+    "example.com",
+    dialer,
+)
+
+// Get connection by server-provided ID
+conn := clientPool.ClientGet("server-provided-id")
+```
+
+**Features:**
+- Server generates unique 8-byte connection IDs
+- Client reads ID from connection after TLS handshake
+- Ideal for load balancing and connection tracking
+- Better for complex distributed systems
+
+### Single-Connection Mode (`isSingle = true`)
+
+In this mode, the pool generates its own IDs and manages connections independently:
+
+```go
+// Single-connection mode - client generates connection IDs
+clientPool := pool.NewClientPool(
+    5, 20,
+    500*time.Millisecond, 5*time.Second,
+    30*time.Second,
+    "0",
+    true,   // Single-connection mode
+    "example.com",
+    dialer,
+)
+
+// Get any available connection (no specific ID needed)
+conn := clientPool.ClientGet("")
+```
+
+**Features:**
+- Client generates its own connection IDs
+- No dependency on server-side ID generation
+- Simpler connection management
+- Better for simple client-server applications
+
+### Mode Comparison
+
+| Aspect | Multi-Connection (`false`) | Single-Connection (`true`) |
+|--------|---------------------------|---------------------------|
+| **ID Generation** | Server-side | Client-side |
+| **Connection Tracking** | Server-controlled | Client-controlled |
+| **Complexity** | Higher | Lower |
+| **Use Case** | Distributed systems | Simple applications |
+| **Load Balancing** | Advanced | Basic |
 
 ## Connection Keep-Alive
 
@@ -266,7 +337,9 @@ clientPool := pool.NewClientPool(
     5, 20,
     500*time.Millisecond, 5*time.Second,
     30*time.Second,  // Keep-alive period
-    "2", "example.com",
+    "2",             // TLS mode
+    false,           // isSingle mode
+    "example.com",   // hostname
     dialer,
 )
 
@@ -329,12 +402,13 @@ import (
 )
 
 func main() {    logger := logs.NewLogger(logs.Info, true)
-    
-    clientPool := pool.NewClientPool(
+      clientPool := pool.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
-        "2", "example.com",
+        "2",
+        false,
+        "example.com",
         func() (net.Conn, error) {
             conn, err := net.Dial("tcp", "example.com:8080")
             if err != nil {
@@ -369,12 +443,13 @@ import (
 func main() {
     // Create a context that can be cancelled    ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
-    
-    clientPool := pool.NewClientPool(
+      clientPool := pool.NewClientPool(
         5, 20,
         500*time.Millisecond, 5*time.Second,
         30*time.Second,
-        "2", "example.com",
+        "2",
+        false,
+        "example.com",
         func() (net.Conn, error) {
             // Use context-aware dialer
             dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -412,12 +487,13 @@ func main() {
     
     pools := make([]*pool.Pool, len(serverAddresses))
       for i, addr := range serverAddresses {
-        serverAddr := addr // Create local copy for closure
-        pools[i] = pool.NewClientPool(
+        serverAddr := addr // Create local copy for closure        pools[i] = pool.NewClientPool(
             5, 20,
             500*time.Millisecond, 5*time.Second,
             30*time.Second,
-            "2", serverAddr[:len(serverAddr)-5], // Extract hostname
+            "2",
+            false,
+            serverAddr[:len(serverAddr)-5], // Extract hostname
             func() (net.Conn, error) {
                 return net.Dial("tcp", serverAddr)
             },
@@ -500,9 +576,8 @@ For ultra-high-throughput systems, consider implementing custom validation strat
 - Verify certificate validity and expiration
 - Check hostname matches certificate Common Name
 - For testing, temporarily use TLS mode `"1"`:
-  ```go
-  // Temporary workaround for testing
-  pool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", hostname, dialer)
+  ```go  // Temporary workaround for testing
+  pool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", false, hostname, dialer)
   ```
 
 #### 3. Pool Exhaustion
