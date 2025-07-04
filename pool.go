@@ -434,19 +434,15 @@ func (p *Pool) adjustCapacity(created int) {
 
 // isActive 检查连接是否处于活跃状态
 func (p *Pool) isActive(conn net.Conn) bool {
-	if err := conn.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
 		return false
 	}
 
-	_, err := conn.Read(make([]byte, 1))
+	_, err := conn.Write([]byte{})
 
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
 		return false
 	}
 
-	if err, ok := err.(net.Error); ok && err.Timeout() {
-		return true
-	}
-
-	return false
+	return err == nil
 }
