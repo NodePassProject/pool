@@ -46,10 +46,18 @@ func NewClientPool(
 	dialer func() (net.Conn, error),
 ) *Pool {
 	if minCap <= 0 {
-		minCap = 1
+		if isSingle {
+			minCap = 0
+		} else {
+			minCap = 1
+		}
 	}
 	if maxCap <= 0 {
-		maxCap = 1
+		if isSingle {
+			maxCap = 0
+		} else {
+			maxCap = 1
+		}
 	}
 	if minCap > maxCap {
 		minCap, maxCap = maxCap, minCap
