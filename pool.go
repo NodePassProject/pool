@@ -316,6 +316,28 @@ func (p *Pool) ServerGet() (string, net.Conn) {
 	}
 }
 
+// Put 将连接放回连接池
+func (p *Pool) Put(id string, conn net.Conn) {
+	if id == "" || conn == nil {
+		return
+	}
+
+	// 防止重复放回
+	if _, loaded := p.conns.LoadOrStore(id, conn); loaded {
+		conn.Close()
+		return
+	}
+
+	select {
+	case p.idChan <- id:
+		// 成功放回连接池
+	default:
+		// 池满，除名并关闭连接
+		p.conns.Delete(id)
+		conn.Close()
+	}
+}
+
 // Flush 清空连接池中的所有连接
 func (p *Pool) Flush() {
 	p.mu.Lock()
