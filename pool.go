@@ -322,6 +322,9 @@ func (p *Pool) ServerGet() (string, net.Conn) {
 
 // Put 将连接放回连接池
 func (p *Pool) Put(id string, conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if conn == nil {
 		return
 	}
