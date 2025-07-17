@@ -92,12 +92,16 @@ func NewClientPool(
 
 // NewServerPool 创建新的服务器连接池
 func NewServerPool(
+	maxCap int,
 	clientIP string,
 	tlsConfig *tls.Config,
 	listener net.Listener,
 	keepAlive time.Duration,
 ) *Pool {
-	maxCap := 65536
+	if maxCap <= 0 {
+		maxCap = 1
+	}
+
 	if listener == nil {
 		return nil
 	}

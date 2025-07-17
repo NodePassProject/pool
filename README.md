@@ -228,23 +228,34 @@ errorCount := clientPool.ErrorCount()
 
 ### Client IP Restriction
 
-The `NewServerPool` function allows you to restrict incoming connections to a specific client IP address:
+The `NewServerPool` function allows you to restrict incoming connections to a specific client IP address. The function signature is:
 
 ```go
-// Create a server pool that only accepts connections from 192.168.1.10
-serverPool := pool.NewServerPool("192.168.1.10", tlsConfig, listener, 30*time.Second)
+func NewServerPool(
+    maxCap int,
+    clientIP string,
+    tlsConfig *tls.Config,
+    listener net.Listener,
+    keepAlive time.Duration,
+) *Pool
 ```
 
+- `maxCap`: Maximum pool capacity.
+- `clientIP`: Restrict allowed client IP ("" for any).
+- `tlsConfig`: TLS configuration (can be nil).
+- `listener`: TCP listener.
+- `keepAlive`: Keep-alive period.
+
 When the `clientIP` parameter is set:
-- All connections from other IP addresses will be immediately closed
-- This provides an additional layer of security beyond network firewalls
-- Particularly useful for internal services or dedicated client-server applications
+- All connections from other IP addresses will be immediately closed.
+- This provides an additional layer of security beyond network firewalls.
+- Particularly useful for internal services or dedicated client-server applications.
 
 To allow connections from any IP address, use an empty string:
 
 ```go
 // Create a server pool that accepts connections from any IP
-serverPool := pool.NewServerPool("", tlsConfig, listener, 30*time.Second)
+serverPool := pool.NewServerPool(20, "", tlsConfig, listener, 30*time.Second)
 ```
 
 ### TLS Security Modes
@@ -267,6 +278,31 @@ clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "1", false, "
 // Verified TLS - production
 clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", false, "example.com", dialer)
 ```
+
+---
+
+**Implementation Details (from pool.go):**
+
+- **Connection ID Generation:**
+  - In multi-connection mode, the server generates an 8-byte ID and sends it to the client after TLS handshake.
+  - In single-connection mode, the client generates its own ID using random bytes.
+
+- **Put Method:**
+  - Prevents duplicate connections in the pool.
+  - If the pool is full or the connection is already present, the connection is closed automatically.
+
+- **Flush/Close:**
+  - `Flush` closes all connections and resets the pool.
+  - `Close` cancels the context and flushes the pool.
+
+- **Dynamic Adjustment:**
+  - `adjustInterval` and `adjustCapacity` are used internally for pool optimization based on usage and success rate.
+
+- **isActive:**
+  - Checks if a connection is alive by sending an empty write with a short deadline.
+
+- **Error Handling:**
+  - `AddError` and `ErrorCount` are thread-safe and use mutex protection.
 
 ## Connection Modes
 
