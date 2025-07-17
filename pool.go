@@ -322,10 +322,13 @@ func (p *Pool) ServerGet() (string, net.Conn) {
 
 // Put 将连接放回连接池
 func (p *Pool) Put(id string, conn net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if conn == nil {
+		return
+	}
+
+	// 判断池是否已满
+	if len(p.idChan) >= p.capacity {
+		conn.Close()
 		return
 	}
 
@@ -335,14 +338,6 @@ func (p *Pool) Put(id string, conn net.Conn) {
 
 	// 防止重复放回
 	if _, loaded := p.conns.LoadOrStore(id, conn); loaded {
-		conn.Close()
-		return
-	}
-
-	// 判断池是否已满
-	if len(p.idChan) >= cap(p.idChan) {
-		// 池满，除名并关闭连接
-		p.conns.Delete(id)
 		conn.Close()
 		return
 	}
