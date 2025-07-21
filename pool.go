@@ -322,7 +322,7 @@ func (p *Pool) ServerGet() (string, net.Conn) {
 
 // Put 将连接放回连接池
 func (p *Pool) Put(id string, conn net.Conn) {
-	if conn == nil {
+	if id == "" || conn == nil {
 		return
 	}
 
@@ -330,10 +330,6 @@ func (p *Pool) Put(id string, conn net.Conn) {
 	if len(p.idChan) >= p.capacity {
 		conn.Close()
 		return
-	}
-
-	if id == "" {
-		id = p.getID()
 	}
 
 	// 防止重复放回
