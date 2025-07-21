@@ -222,6 +222,9 @@ clientPool.AddError()
 
 // Get the current error count
 errorCount := clientPool.ErrorCount()
+
+// Reset the error count to zero
+clientPool.ResetError()
 ```
 
 ## Security Features

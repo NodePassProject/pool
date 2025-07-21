@@ -404,6 +404,13 @@ func (p *Pool) ErrorCount() int {
 	return p.errCount
 }
 
+// ResetError 重置错误计数
+func (p *Pool) ResetError() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errCount = 0
+}
+
 // getID 生成唯一的连接ID
 func (p *Pool) getID() string {
 	bytes := make([]byte, 4)
