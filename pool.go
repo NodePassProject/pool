@@ -326,12 +326,6 @@ func (p *Pool) Put(id string, conn net.Conn) {
 		return
 	}
 
-	// 判断池是否已满
-	if len(p.idChan) >= p.maxCap {
-		conn.Close()
-		return
-	}
-
 	// 防止重复放回
 	if _, loaded := p.conns.LoadOrStore(id, conn); loaded {
 		conn.Close()
