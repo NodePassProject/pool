@@ -327,7 +327,7 @@ func (p *Pool) Put(id string, conn net.Conn) {
 	}
 
 	// 判断池是否已满
-	if len(p.idChan) >= p.capacity {
+	if len(p.idChan) >= p.maxCap {
 		conn.Close()
 		return
 	}
