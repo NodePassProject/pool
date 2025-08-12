@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -33,6 +34,29 @@ type Pool struct {
 	keepAlive time.Duration            // 保活间隔
 	ctx       context.Context          // 上下文
 	cancel    context.CancelFunc       // 取消函数
+}
+
+// TCP缓冲区池
+var tcpBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 8)
+	},
+}
+
+// getTCPBuffer 从池中获取TCP缓冲区
+func getTCPBuffer() []byte {
+	buf := tcpBufferPool.Get().([]byte)
+	if cap(buf) < 8 {
+		return make([]byte, 8)
+	}
+	return buf[:8]
+}
+
+// putTCPBuffer 将TCP缓冲区归还到池中
+func putTCPBuffer(buf []byte) {
+	if buf != nil {
+		tcpBufferPool.Put(buf)
+	}
 }
 
 // NewClientPool 创建新的客户端连接池
@@ -180,14 +204,25 @@ func (p *Pool) ClientManager() {
 						conn = tlsConn
 					}
 
-					// 读取连接ID
-					buf := make([]byte, 8)
-					n, err := conn.Read(buf)
+					// 接收连接ID
+					conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+					buf := getTCPBuffer()
+					n, err := io.ReadFull(conn, buf)
 					if err != nil || n != 8 {
 						conn.Close()
+						putTCPBuffer(buf)
 						continue
 					}
 					id = string(buf[:n])
+					putTCPBuffer(buf)
+					conn.SetReadDeadline(time.Time{})
+
+					// 发送连接ID
+					_, err = conn.Write([]byte(id))
+					if err != nil {
+						conn.Close()
+						continue
+					}
 				} else {
 					id = p.getID()
 				}
@@ -245,18 +280,31 @@ func (p *Pool) ServerManager() {
 				conn = tlsConn
 			}
 
-			// 生成并发送连接ID
+			// 生成连接ID
 			id := p.getID()
 			if _, exist := p.conns.Load(id); exist {
 				conn.Close()
 				continue
 			}
 
+			// 发送连接ID
 			_, err = conn.Write([]byte(id))
 			if err != nil {
 				conn.Close()
 				continue
 			}
+
+			// 验证连接ID
+			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+			buf := getTCPBuffer()
+			n, err := io.ReadFull(conn, buf)
+			if err != nil || id != string(buf[:n]) {
+				conn.Close()
+				putTCPBuffer(buf)
+				continue
+			}
+			putTCPBuffer(buf)
+			conn.SetReadDeadline(time.Time{})
 
 			select {
 			case p.idChan <- id:
