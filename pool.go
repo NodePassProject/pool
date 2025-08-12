@@ -351,9 +351,11 @@ func (p *Pool) ClientGet(id string) net.Conn {
 }
 
 // ServerGet 获取一个可用的服务器连接及其ID
-func (p *Pool) ServerGet() (string, net.Conn) {
+func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn) {
 	for {
 		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err().Error(), nil
 		case id := <-p.idChan:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
 				netConn := conn.(net.Conn)
@@ -362,8 +364,8 @@ func (p *Pool) ServerGet() (string, net.Conn) {
 				}
 				netConn.Close()
 			}
-		case <-p.ctx.Done():
-			return p.ctx.Err().Error(), nil
+		case <-time.After(timeout):
+			return "insufficient pool connections", nil
 		}
 	}
 }
