@@ -18,7 +18,6 @@ type Pool struct {
 	conns     sync.Map                 // 存储连接的映射表
 	idChan    chan string              // 可用ID通道
 	tlsCode   string                   // TLS安全模式代码
-	isSingle  bool                     // 是否单端转发
 	hostname  string                   // 主机名
 	clientIP  string                   // 客户端IP
 	tlsConfig *tls.Config              // TLS配置
@@ -39,23 +38,25 @@ type Pool struct {
 // TCP缓冲区池
 var tcpBufferPool = sync.Pool{
 	New: func() any {
-		return make([]byte, 8)
+		b := make([]byte, 8)
+		return &b
 	},
 }
 
 // getTCPBuffer 从池中获取TCP缓冲区
 func getTCPBuffer() []byte {
-	buf := tcpBufferPool.Get().([]byte)
-	if cap(buf) < 8 {
-		return make([]byte, 8)
+	buf := tcpBufferPool.Get().(*[]byte)
+	if cap(*buf) < 8 {
+		b := make([]byte, 8)
+		return b
 	}
-	return buf[:8]
+	return (*buf)[:8]
 }
 
 // putTCPBuffer 将TCP缓冲区归还到池中
 func putTCPBuffer(buf []byte) {
 	if buf != nil {
-		tcpBufferPool.Put(buf)
+		tcpBufferPool.Put(&buf)
 	}
 }
 
@@ -65,23 +66,14 @@ func NewClientPool(
 	minIvl, maxIvl time.Duration,
 	keepAlive time.Duration,
 	tlsCode string,
-	isSingle bool,
 	hostname string,
 	dialer func() (net.Conn, error),
 ) *Pool {
 	if minCap <= 0 {
-		if isSingle {
-			minCap = 0
-		} else {
-			minCap = 1
-		}
+		minCap = 1
 	}
 	if maxCap <= 0 {
-		if isSingle {
-			maxCap = 0
-		} else {
-			maxCap = 1
-		}
+		maxCap = 1
 	}
 	if minCap > maxCap {
 		minCap, maxCap = maxCap, minCap
@@ -101,7 +93,6 @@ func NewClientPool(
 		conns:     sync.Map{},
 		idChan:    make(chan string, maxCap),
 		tlsCode:   tlsCode,
-		isSingle:  isSingle,
 		hostname:  hostname,
 		dialer:    dialer,
 		capacity:  minCap,
@@ -172,59 +163,55 @@ func (p *Pool) ClientManager() {
 				conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
 				var id string
-				if !p.isSingle {
-					// 根据TLS代码应用不同级别的TLS安全
-					switch p.tlsCode {
-					case "0":
-						// 不使用TLS
-					case "1":
-						// 使用自签名证书（不验证）
-						tlsConn := tls.Client(conn, &tls.Config{
-							InsecureSkipVerify: true,
-							MinVersion:         tls.VersionTLS13,
-						})
-						err := tlsConn.Handshake()
-						if err != nil {
-							conn.Close()
-							continue
-						}
-						conn = tlsConn
-					case "2":
-						// 使用验证证书（安全模式）
-						tlsConn := tls.Client(conn, &tls.Config{
-							InsecureSkipVerify: false,
-							MinVersion:         tls.VersionTLS13,
-							ServerName:         p.hostname,
-						})
-						err := tlsConn.Handshake()
-						if err != nil {
-							conn.Close()
-							continue
-						}
-						conn = tlsConn
-					}
-
-					// 接收连接ID
-					conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-					buf := getTCPBuffer()
-					n, err := io.ReadFull(conn, buf)
-					if err != nil || n != 8 {
-						conn.Close()
-						putTCPBuffer(buf)
-						continue
-					}
-					id = string(buf[:n])
-					putTCPBuffer(buf)
-					conn.SetReadDeadline(time.Time{})
-
-					// 发送连接ID
-					_, err = conn.Write([]byte(id))
+				// 根据TLS代码应用不同级别的TLS安全
+				switch p.tlsCode {
+				case "0":
+					// 不使用TLS
+				case "1":
+					// 使用自签名证书（不验证）
+					tlsConn := tls.Client(conn, &tls.Config{
+						InsecureSkipVerify: true,
+						MinVersion:         tls.VersionTLS13,
+					})
+					err := tlsConn.Handshake()
 					if err != nil {
 						conn.Close()
 						continue
 					}
-				} else {
-					id = p.getID()
+					conn = tlsConn
+				case "2":
+					// 使用验证证书（安全模式）
+					tlsConn := tls.Client(conn, &tls.Config{
+						InsecureSkipVerify: false,
+						MinVersion:         tls.VersionTLS13,
+						ServerName:         p.hostname,
+					})
+					err := tlsConn.Handshake()
+					if err != nil {
+						conn.Close()
+						continue
+					}
+					conn = tlsConn
+				}
+
+				// 接收连接ID
+				conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+				buf := getTCPBuffer()
+				n, err := io.ReadFull(conn, buf)
+				if err != nil || n != 8 {
+					conn.Close()
+					putTCPBuffer(buf)
+					continue
+				}
+				id = string(buf[:n])
+				putTCPBuffer(buf)
+				conn.SetReadDeadline(time.Time{})
+
+				// 发送连接ID
+				_, err = conn.Write([]byte(id))
+				if err != nil {
+					conn.Close()
+					continue
 				}
 
 				select {
@@ -318,36 +305,13 @@ func (p *Pool) ServerManager() {
 
 // ClientGet 获取指定ID的客户端连接
 func (p *Pool) ClientGet(id string) net.Conn {
-	if id == "" {
-		for {
-			select {
-			case <-p.ctx.Done():
-				return nil
-			case id := <-p.idChan:
-				if conn, ok := p.conns.LoadAndDelete(id); ok {
-					netConn := conn.(net.Conn)
-					if p.isActive(netConn) {
-						return netConn
-					}
-					netConn.Close()
-				}
-			default:
-				conn, err := p.dialer()
-				if err != nil {
-					return nil
-				}
-				return conn
-			}
-		}
-	} else {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if conn, ok := p.conns.LoadAndDelete(id); ok {
-			p.removeID(id)
-			return conn.(net.Conn)
-		}
-		return nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if conn, ok := p.conns.LoadAndDelete(id); ok {
+		p.removeID(id)
+		return conn.(net.Conn)
 	}
+	return nil
 }
 
 // ServerGet 获取一个可用的服务器连接及其ID
@@ -399,11 +363,11 @@ func (p *Pool) Flush() {
 
 	var wg sync.WaitGroup
 	p.conns.Range(func(key, value any) bool {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			value.(net.Conn).Close()
-		}()
+		wg.Go(func() {
+			if value != nil {
+				value.(net.Conn).Close()
+			}
+		})
 		return true
 	})
 	wg.Wait()
@@ -476,13 +440,11 @@ func (p *Pool) removeID(id string) {
 	for {
 		select {
 		case tmp := <-p.idChan:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				if tmp != id {
 					tmpChan <- tmp
 				}
-			}()
+			})
 		default:
 			wg.Wait()
 			p.idChan = tmpChan
