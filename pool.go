@@ -141,92 +141,91 @@ func (p *Pool) ClientManager() {
 	var mu sync.Mutex
 
 	for {
-		select {
-		case <-p.ctx.Done():
+		if p.ctx.Err() != nil {
 			return
-		default:
-			if !mu.TryLock() {
+		}
+
+		if !mu.TryLock() {
+			continue
+		}
+
+		p.adjustInterval()
+		created := 0
+
+		// 填充连接池至目标容量
+		for len(p.idChan) < p.capacity {
+			conn, err := p.dialer()
+			if err != nil {
 				continue
 			}
 
-			p.adjustInterval()
-			created := 0
+			conn.(*net.TCPConn).SetKeepAlive(true)
+			conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
-			// 填充连接池至目标容量
-			for len(p.idChan) < p.capacity {
-				conn, err := p.dialer()
-				if err != nil {
-					continue
-				}
-
-				conn.(*net.TCPConn).SetKeepAlive(true)
-				conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
-
-				var id string
-				// 根据TLS代码应用不同级别的TLS安全
-				switch p.tlsCode {
-				case "0":
-					// 不使用TLS
-				case "1":
-					// 使用自签名证书（不验证）
-					tlsConn := tls.Client(conn, &tls.Config{
-						InsecureSkipVerify: true,
-						MinVersion:         tls.VersionTLS13,
-					})
-					err := tlsConn.Handshake()
-					if err != nil {
-						conn.Close()
-						continue
-					}
-					conn = tlsConn
-				case "2":
-					// 使用验证证书（安全模式）
-					tlsConn := tls.Client(conn, &tls.Config{
-						InsecureSkipVerify: false,
-						MinVersion:         tls.VersionTLS13,
-						ServerName:         p.hostname,
-					})
-					err := tlsConn.Handshake()
-					if err != nil {
-						conn.Close()
-						continue
-					}
-					conn = tlsConn
-				}
-
-				// 接收连接ID
-				conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-				buf := getTCPBuffer()
-				n, err := io.ReadFull(conn, buf)
-				if err != nil || n != 8 {
-					conn.Close()
-					putTCPBuffer(buf)
-					continue
-				}
-				id = string(buf[:n])
-				putTCPBuffer(buf)
-				conn.SetReadDeadline(time.Time{})
-
-				// 发送连接ID
-				_, err = conn.Write([]byte(id))
+			var id string
+			// 根据TLS代码应用不同级别的TLS安全
+			switch p.tlsCode {
+			case "0":
+				// 不使用TLS
+			case "1":
+				// 使用自签名证书（不验证）
+				tlsConn := tls.Client(conn, &tls.Config{
+					InsecureSkipVerify: true,
+					MinVersion:         tls.VersionTLS13,
+				})
+				err := tlsConn.Handshake()
 				if err != nil {
 					conn.Close()
 					continue
 				}
-
-				select {
-				case p.idChan <- id:
-					p.conns.Store(id, conn)
-					created++
-				default:
+				conn = tlsConn
+			case "2":
+				// 使用验证证书（安全模式）
+				tlsConn := tls.Client(conn, &tls.Config{
+					InsecureSkipVerify: false,
+					MinVersion:         tls.VersionTLS13,
+					ServerName:         p.hostname,
+				})
+				err := tlsConn.Handshake()
+				if err != nil {
 					conn.Close()
+					continue
 				}
+				conn = tlsConn
 			}
 
-			p.adjustCapacity(created)
-			mu.Unlock()
-			time.Sleep(p.interval)
+			// 接收连接ID
+			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+			buf := getTCPBuffer()
+			n, err := io.ReadFull(conn, buf)
+			if err != nil || n != 8 {
+				conn.Close()
+				putTCPBuffer(buf)
+				continue
+			}
+			id = string(buf[:n])
+			putTCPBuffer(buf)
+			conn.SetReadDeadline(time.Time{})
+
+			// 发送连接ID
+			_, err = conn.Write([]byte(id))
+			if err != nil {
+				conn.Close()
+				continue
+			}
+
+			select {
+			case p.idChan <- id:
+				p.conns.Store(id, conn)
+				created++
+			default:
+				conn.Close()
+			}
 		}
+
+		p.adjustCapacity(created)
+		mu.Unlock()
+		time.Sleep(p.interval)
 	}
 }
 
@@ -238,67 +237,75 @@ func (p *Pool) ServerManager() {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	for {
-		select {
-		case <-p.ctx.Done():
+		if p.ctx.Err() != nil {
 			return
-		default:
-			conn, err := p.listener.Accept()
-			if err != nil {
-				continue
-			}
+		}
 
-			conn.(*net.TCPConn).SetKeepAlive(true)
-			conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
-
-			// 验证客户端IP（如果指定）
-			if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
-				conn.Close()
-				continue
+		conn, err := p.listener.Accept()
+		if err != nil {
+			if p.ctx.Err() != nil || err == net.ErrClosed {
+				return
 			}
-
-			// 应用TLS（如果配置）
-			if p.tlsConfig != nil {
-				tlsConn := tls.Server(conn, p.tlsConfig)
-				err := tlsConn.Handshake()
-				if err != nil {
-					conn.Close()
-					continue
-				}
-				conn = tlsConn
-			}
-
-			// 生成连接ID
-			id := p.getID()
-			if _, exist := p.conns.Load(id); exist {
-				conn.Close()
-				continue
-			}
-
-			// 发送连接ID
-			_, err = conn.Write([]byte(id))
-			if err != nil {
-				conn.Close()
-				continue
-			}
-
-			// 验证连接ID
-			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-			buf := getTCPBuffer()
-			n, err := io.ReadFull(conn, buf)
-			if err != nil || id != string(buf[:n]) {
-				conn.Close()
-				putTCPBuffer(buf)
-				continue
-			}
-			putTCPBuffer(buf)
-			conn.SetReadDeadline(time.Time{})
 
 			select {
-			case p.idChan <- id:
-				p.conns.Store(id, conn)
-			default:
-				conn.Close()
+			case <-p.ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
 			}
+			continue
+		}
+
+		conn.(*net.TCPConn).SetKeepAlive(true)
+		conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
+
+		// 验证客户端IP（如果指定）
+		if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
+			conn.Close()
+			continue
+		}
+
+		// 应用TLS（如果配置）
+		if p.tlsConfig != nil {
+			tlsConn := tls.Server(conn, p.tlsConfig)
+			err := tlsConn.Handshake()
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			conn = tlsConn
+		}
+
+		// 生成连接ID
+		id := p.getID()
+		if _, exist := p.conns.Load(id); exist {
+			conn.Close()
+			continue
+		}
+
+		// 发送连接ID
+		_, err = conn.Write([]byte(id))
+		if err != nil {
+			conn.Close()
+			continue
+		}
+
+		// 验证连接ID
+		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+		buf := getTCPBuffer()
+		n, err := io.ReadFull(conn, buf)
+		if err != nil || id != string(buf[:n]) {
+			conn.Close()
+			putTCPBuffer(buf)
+			continue
+		}
+		putTCPBuffer(buf)
+		conn.SetReadDeadline(time.Time{})
+
+		select {
+		case p.idChan <- id:
+			p.conns.Store(id, conn)
+		default:
+			conn.Close()
 		}
 	}
 }
