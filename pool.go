@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -311,32 +312,32 @@ func (p *Pool) ServerManager() {
 }
 
 // ClientGet 获取指定ID的客户端连接
-func (p *Pool) ClientGet(id string) net.Conn {
+func (p *Pool) ClientGet(id string) (net.Conn, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if conn, ok := p.conns.LoadAndDelete(id); ok {
 		p.removeID(id)
-		return conn.(net.Conn)
+		return conn.(net.Conn), nil
 	}
-	return nil
+	return nil, fmt.Errorf("pool connection not found")
 }
 
 // ServerGet 获取一个可用的服务器连接及其ID
-func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn) {
+func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn, error) {
 	for {
 		select {
 		case <-p.ctx.Done():
-			return p.ctx.Err().Error(), nil
+			return "", nil, p.ctx.Err()
 		case id := <-p.idChan:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
 				netConn := conn.(net.Conn)
 				if p.isActive(netConn) {
-					return id, netConn
+					return id, netConn, nil
 				}
 				netConn.Close()
 			}
 		case <-time.After(timeout):
-			return "insufficient pool connections", nil
+			return "", nil, fmt.Errorf("insufficient pool connections")
 		}
 	}
 }

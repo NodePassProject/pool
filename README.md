@@ -84,7 +84,11 @@ func main() {
     go pool.ClientManager()
     
     // Use the pool
-    conn := pool.ClientGet("connection-id")
+    conn, err := pool.ClientGet("connection-id")
+    if err != nil {
+        // Handle error...
+        return
+    }
     if conn != nil {
         // Use connection...
         defer conn.Close()
@@ -133,7 +137,11 @@ func main() {    // Create a dialer function
     go clientPool.ClientManager()
     
     // Get a connection by ID (usually received from the server)
-    conn := clientPool.ClientGet("connection-id")
+    conn, err := clientPool.ClientGet("connection-id")
+    if err != nil {
+        // Handle error...
+        return
+    }
     
     // Use the connection...
     
@@ -141,6 +149,8 @@ func main() {    // Create a dialer function
     clientPool.Close()
 }
 ```
+
+**Note:** `ClientGet` now returns `(net.Conn, error)`. The error indicates if the connection with the specified ID was not found in the pool.
 
 ### Server Connection Pool
 
@@ -176,7 +186,11 @@ func main() {
     go serverPool.ServerManager()
     
     // Get a new connection from the pool (blocks until available)
-    id, conn := serverPool.ServerGet(30 * time.Second)
+    id, conn, err := serverPool.ServerGet(30 * time.Second)
+    if err != nil {
+        // Handle error (timeout or pool closed)
+        return
+    }
     
     // Use the connection...
     
@@ -184,6 +198,11 @@ func main() {
     serverPool.Close()
 }
 ```
+
+**Note:** `ServerGet` now returns `(string, net.Conn, error)`. The error can indicate:
+- Timeout: when no connection becomes available within the specified timeout
+- Context cancellation: when the pool is being closed
+- Other pool-related errors
 
 ### Returning Connections
 
@@ -203,6 +222,23 @@ If the pool is full or the connection is already present, `Put` will close the c
 ### Managing Pool Health
 
 ```go
+// Get a connection from client pool by ID
+conn, err := clientPool.ClientGet("connection-id")
+if err != nil {
+    // Connection with the specified ID not found
+    log.Printf("Connection not found: %v", err)
+}
+
+// Get a connection from server pool with timeout
+id, conn, err := serverPool.ServerGet(30 * time.Second)
+if err != nil {
+    // Handle various error cases:
+    // - Timeout: no connection available within the specified time
+    // - Context cancellation: pool is being closed
+    // - Other pool errors
+    log.Printf("Failed to get connection: %v", err)
+}
+
 // Check if the pool is ready
 if clientPool.Ready() {
     // The pool is initialized and ready for use
@@ -292,6 +328,15 @@ clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example
 - **Connection ID Generation:**
   - The server generates an 8-byte ID and sends it to the client after TLS handshake.
   - Connection IDs are used for tracking and managing individual connections.
+
+- **ClientGet Method:**
+  - Returns `(net.Conn, error)` where error indicates if the connection ID was not found.
+  - Thread-safe with mutex protection.
+
+- **ServerGet Method:**
+  - Returns `(string, net.Conn, error)` where error can indicate timeout, context cancellation, or other pool errors.
+  - Blocks until a connection is available or timeout is reached.
+  - Validates connection health before returning.
 
 - **Put Method:**
   - Prevents duplicate connections in the pool.
@@ -498,7 +543,11 @@ func main() {
     }
     
     // Usage
-    id, conn := getNextPool().ServerGet(30 * time.Second)
+    id, conn, err := getNextPool().ServerGet(30 * time.Second)
+    if err != nil {
+        // Handle error...
+        return
+    }
     
     // Use connection...
     
@@ -570,8 +619,10 @@ For ultra-high-throughput systems, consider implementing custom validation strat
   ```
 
 #### 3. Pool Exhaustion
-**Symptoms:** `ServerGet()` blocks indefinitely or times out  
+**Symptoms:** `ServerGet()` returns an error or times out  
 **Solutions:**
+- Check network connectivity to target host
+- Verify server address and port are correct
 - Increase maximum capacity
 - Reduce connection hold time in application code
 - Check for connection leaks (ensure connections are properly closed)
@@ -653,7 +704,12 @@ maxInterval := 10 * time.Second
 #### Always Return Connections
 ```go
 // GOOD: Always return connections
-id, conn := serverPool.ServerGet(30 * time.Second)
+id, conn, err := serverPool.ServerGet(30 * time.Second)
+if err != nil {
+    // Handle timeout or other errors
+    log.Printf("Failed to get connection: %v", err)
+    return err
+}
 if conn != nil {
     defer func() {
         if err := processData(conn); err != nil {
@@ -666,7 +722,7 @@ if conn != nil {
 }
 
 // BAD: Forgetting to return connections leads to pool exhaustion
-id, conn := serverPool.ServerGet(30 * time.Second)
+id, conn, _ := serverPool.ServerGet(30 * time.Second)
 // Missing Put() or Close() - causes connection leak!
 ```
 
@@ -674,11 +730,16 @@ id, conn := serverPool.ServerGet(30 * time.Second)
 ```go
 // Use reasonable timeouts for ServerGet
 timeout := 10 * time.Second
-id, conn := serverPool.ServerGet(timeout)
+id, conn, err := serverPool.ServerGet(timeout)
+if err != nil {
+    // Handle timeout or other errors
+    log.Printf("Failed to get connection within %v: %v", timeout, err)
+    return err
+}
 if conn == nil {
-    // Handle timeout case
-    log.Printf("Failed to get connection within %v", timeout)
-    return errors.New("connection pool timeout")
+    // This should not happen if err is nil, but keeping for safety
+    log.Printf("Unexpected: got nil connection without error")
+    return errors.New("unexpected nil connection")
 }
 ```
 
@@ -694,13 +755,13 @@ type PoolManager struct {
 
 func (pm *PoolManager) getConnectionWithRetry(maxRetries int) (string, net.Conn, error) {
     for i := 0; i < maxRetries; i++ {
-        id, conn := pm.pool.ServerGet(5 * time.Second)
-        if conn != nil {
+        id, conn, err := pm.pool.ServerGet(5 * time.Second)
+        if err == nil && conn != nil {
             return id, conn, nil
         }
         
         // Log and track the error
-        pm.logger.Printf("Connection attempt %d failed", i+1)
+        pm.logger.Printf("Connection attempt %d failed: %v", i+1, err)
         pm.pool.AddError()
         
         // Exponential backoff
@@ -801,7 +862,12 @@ type Server struct {
 
 func (s *Server) goodHandler(w http.ResponseWriter, r *http.Request) {
     // DO: Reuse existing pool
-    id, conn := s.apiPool.ServerGet(10 * time.Second)
+    id, conn, err := s.apiPool.ServerGet(10 * time.Second)
+    if err != nil {
+        // Handle error
+        http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+        return
+    }
     if conn != nil {
         defer s.apiPool.Put(id, conn)
         // Use connection...
@@ -870,7 +936,24 @@ func TestPoolIntegration(t *testing.T) {
     defer clientPool.Close()
     
     // Test connection flow
-    // ... test logic
+    id, conn, err := serverPool.ServerGet(5 * time.Second)
+    require.NoError(t, err)
+    require.NotNil(t, conn)
+    require.NotEmpty(t, id)
+    
+    // Test client get connection
+    clientConn, err := clientPool.ClientGet(id)
+    require.NoError(t, err)
+    require.NotNil(t, clientConn)
+    
+    // Test error case - non-existent ID
+    _, err = clientPool.ClientGet("non-existent-id")
+    require.Error(t, err)
+    
+    // Test timeout case
+    _, _, err = serverPool.ServerGet(1 * time.Millisecond)
+    require.Error(t, err)
+    // ... additional test logic
 }
 ```
 
