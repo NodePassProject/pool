@@ -39,19 +39,19 @@ type Pool struct {
 // TCP缓冲区池
 var tcpBufferPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 8)
+		b := make([]byte, 8192)
 		return &b
 	},
 }
 
-// getTCPBuffer 从池中获取TCP缓冲区
-func getTCPBuffer() []byte {
+// getTCPBuffer 从池中获取指定大小的TCP缓冲区
+func getTCPBuffer(size int) []byte {
 	buf := tcpBufferPool.Get().(*[]byte)
-	if cap(*buf) < 8 {
-		b := make([]byte, 8)
+	if cap(*buf) < size {
+		b := make([]byte, size)
 		return b
 	}
-	return (*buf)[:8]
+	return (*buf)[:size]
 }
 
 // putTCPBuffer 将TCP缓冲区归还到池中
@@ -197,7 +197,7 @@ func (p *Pool) ClientManager() {
 
 			// 接收连接ID
 			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-			buf := getTCPBuffer()
+			buf := getTCPBuffer(8)
 			n, err := io.ReadFull(conn, buf)
 			if err != nil || n != 8 {
 				conn.Close()
@@ -292,7 +292,7 @@ func (p *Pool) ServerManager() {
 
 		// 验证连接ID
 		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-		buf := getTCPBuffer()
+		buf := getTCPBuffer(8)
 		n, err := io.ReadFull(conn, buf)
 		if err != nil || id != string(buf[:n]) {
 			conn.Close()
@@ -345,6 +345,12 @@ func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn, error) {
 // Put 将连接放回连接池
 func (p *Pool) Put(id string, conn net.Conn) {
 	if id == "" || conn == nil {
+		return
+	}
+
+	// 清空连接残留数据
+	if !p.drainConn(conn) {
+		conn.Close()
 		return
 	}
 
@@ -490,6 +496,28 @@ func (p *Pool) adjustCapacity(created int) {
 
 	if ratio > 0.8 && p.capacity < p.maxCap {
 		p.capacity++
+	}
+}
+
+// drainConn 清空连接中的残留数据
+func (p *Pool) drainConn(conn net.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(p.keepAlive))
+	defer conn.SetReadDeadline(time.Time{})
+
+	buf := getTCPBuffer(8192)
+	defer putTCPBuffer(buf)
+
+	for {
+		n, err := conn.Read(buf)
+		if n == 0 || err != nil {
+			if err == nil || err == io.EOF {
+				return true
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return true
+			}
+			return false
+		}
 	}
 }
 
