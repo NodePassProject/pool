@@ -48,8 +48,7 @@ var tcpBufferPool = sync.Pool{
 func getTCPBuffer(size int) []byte {
 	buf := tcpBufferPool.Get().(*[]byte)
 	if cap(*buf) < size {
-		b := make([]byte, size)
-		return b
+		return make([]byte, size)
 	}
 	return (*buf)[:size]
 }
@@ -510,7 +509,7 @@ func (p *Pool) drainConn(conn net.Conn) bool {
 	for {
 		n, err := conn.Read(buf)
 		if n == 0 || err != nil {
-			if err == nil || err == io.EOF {
+			if err == nil {
 				return true
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
