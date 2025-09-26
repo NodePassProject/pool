@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const BufferSize = 2048 // TCP缓冲区大小
+
 // Pool 连接池结构体，用于管理多个网络连接
 type Pool struct {
 	mu        sync.Mutex               // 互斥锁，保护共享资源访问
@@ -81,7 +83,7 @@ func NewClientPool(
 		keepAlive: keepAlive,
 		bufPool: &sync.Pool{
 			New: func() any {
-				b := make([]byte, 8192)
+				b := make([]byte, BufferSize)
 				return &b
 			},
 		},
@@ -114,7 +116,7 @@ func NewServerPool(
 		keepAlive: keepAlive,
 		bufPool: &sync.Pool{
 			New: func() any {
-				b := make([]byte, 2048)
+				b := make([]byte, BufferSize)
 				return &b
 			},
 		},
@@ -124,12 +126,12 @@ func NewServerPool(
 // getTCPBuffer 获取TCP缓冲区
 func (p *Pool) getTCPBuffer() []byte {
 	buf := p.bufPool.Get().(*[]byte)
-	return (*buf)[:2048]
+	return (*buf)[:BufferSize]
 }
 
 // putTCPBuffer 归还TCP缓冲区
 func (p *Pool) putTCPBuffer(buf []byte) {
-	if buf != nil && cap(buf) >= 2048 {
+	if buf != nil && cap(buf) >= BufferSize {
 		p.bufPool.Put(&buf)
 	}
 }
