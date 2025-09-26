@@ -114,25 +114,22 @@ func NewServerPool(
 		keepAlive: keepAlive,
 		bufPool: &sync.Pool{
 			New: func() any {
-				b := make([]byte, 8192)
+				b := make([]byte, 2048)
 				return &b
 			},
 		},
 	}
 }
 
-// getTCPBuffer 从池中获取指定大小的TCP缓冲区
-func (p *Pool) getTCPBuffer(size int) []byte {
+// getTCPBuffer 获取TCP缓冲区
+func (p *Pool) getTCPBuffer() []byte {
 	buf := p.bufPool.Get().(*[]byte)
-	if cap(*buf) < size {
-		return make([]byte, size)
-	}
-	return (*buf)[:size]
+	return (*buf)[:2048]
 }
 
-// putTCPBuffer 将TCP缓冲区归还到池中
+// putTCPBuffer 归还TCP缓冲区
 func (p *Pool) putTCPBuffer(buf []byte) {
-	if buf != nil {
+	if buf != nil && cap(buf) >= 2048 {
 		p.bufPool.Put(&buf)
 	}
 }
@@ -201,7 +198,7 @@ func (p *Pool) ClientManager() {
 
 			// 接收连接ID
 			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-			buf := p.getTCPBuffer(8)
+			buf := p.getTCPBuffer()
 			n, err := io.ReadFull(conn, buf)
 			if err != nil || n != 8 {
 				conn.Close()
@@ -296,7 +293,7 @@ func (p *Pool) ServerManager() {
 
 		// 验证连接ID
 		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-		buf := p.getTCPBuffer(8)
+		buf := p.getTCPBuffer()
 		n, err := io.ReadFull(conn, buf)
 		if err != nil || id != string(buf[:n]) {
 			conn.Close()
@@ -508,7 +505,7 @@ func (p *Pool) drainConn(conn net.Conn) bool {
 	conn.SetReadDeadline(time.Now().Add(p.keepAlive))
 	defer conn.SetReadDeadline(time.Time{})
 
-	buf := p.getTCPBuffer(8192)
+	buf := p.getTCPBuffer()
 	defer p.putTCPBuffer(buf)
 
 	for {
