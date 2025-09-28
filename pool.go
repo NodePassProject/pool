@@ -181,13 +181,6 @@ func (p *Pool) ClientManager() {
 			id = string(buf[:n])
 			conn.SetReadDeadline(time.Time{})
 
-			// 发送连接ID
-			_, err = conn.Write([]byte(id))
-			if err != nil {
-				conn.Close()
-				continue
-			}
-
 			select {
 			case p.idChan <- id:
 				p.conns.Store(id, conn)
@@ -262,16 +255,6 @@ func (p *Pool) ServerManager() {
 			conn.Close()
 			continue
 		}
-
-		// 验证连接ID
-		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-		buf := make([]byte, 8)
-		n, err := io.ReadFull(conn, buf)
-		if err != nil || id != string(buf[:n]) {
-			conn.Close()
-			continue
-		}
-		conn.SetReadDeadline(time.Time{})
 
 		select {
 		case p.idChan <- id:
