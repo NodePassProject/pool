@@ -181,6 +181,7 @@ func (p *Pool) ClientManager() {
 			id = string(buf[:n])
 			conn.SetReadDeadline(time.Time{})
 
+			<-time.After(time.Second)
 			select {
 			case p.idChan <- id:
 				p.conns.Store(id, conn)
