@@ -331,14 +331,24 @@ func (p *Pool) Put(id string, conn net.Conn) {
 		return
 	}
 
-	select {
-	case p.idChan <- id:
-		// 成功放回连接池
-	default:
-		// 池满，除名并关闭连接
-		p.conns.Delete(id)
-		conn.Close()
-	}
+	// 防止立即复用导致竞态
+	go func() {
+		select {
+		case <-time.After(p.interval):
+			select {
+			case p.idChan <- id:
+				// 成功放回连接池
+			default:
+				// 池满，除名并关闭连接
+				p.conns.Delete(id)
+				conn.Close()
+			}
+		case <-p.ctx.Done():
+			p.conns.Delete(id)
+			conn.Close()
+			return
+		}
+	}()
 }
 
 // Flush 清空连接池中的所有连接
