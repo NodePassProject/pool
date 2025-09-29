@@ -13,6 +13,22 @@ import (
 	"time"
 )
 
+const (
+	defaultMinCap           = 1
+	defaultMaxCap           = 1
+	defaultMinIvl           = time.Second
+	defaultMaxIvl           = time.Second
+	readTimeout             = 20 * time.Second
+	acceptRetryInterval     = 50 * time.Millisecond
+	intervalAdjustStep      = 100 * time.Millisecond
+	capacityAdjustLowRatio  = 0.2
+	capacityAdjustHighRatio = 0.8
+	intervalLowThreshold    = 0.2
+	intervalHighThreshold   = 0.8
+	drainBufferSize         = 2048
+	activeCheckTimeout      = 20 * time.Millisecond
+)
+
 // Pool 连接池结构体，用于管理多个网络连接
 type Pool struct {
 	mu        sync.Mutex               // 互斥锁，保护共享资源访问
@@ -46,20 +62,20 @@ func NewClientPool(
 	dialer func() (net.Conn, error),
 ) *Pool {
 	if minCap <= 0 {
-		minCap = 1
+		minCap = defaultMinCap
 	}
 	if maxCap <= 0 {
-		maxCap = 1
+		maxCap = defaultMaxCap
 	}
 	if minCap > maxCap {
 		minCap, maxCap = maxCap, minCap
 	}
 
 	if minIvl <= 0 {
-		minIvl = time.Second
+		minIvl = defaultMinIvl
 	}
 	if maxIvl <= 0 {
-		maxIvl = time.Second
+		maxIvl = defaultMaxIvl
 	}
 	if minIvl > maxIvl {
 		minIvl, maxIvl = maxIvl, minIvl
@@ -90,7 +106,7 @@ func NewServerPool(
 	keepAlive time.Duration,
 ) *Pool {
 	if maxCap <= 0 {
-		maxCap = 1
+		maxCap = defaultMaxCap
 	}
 
 	if listener == nil {
@@ -171,7 +187,7 @@ func (p *Pool) ClientManager() {
 			}
 
 			// 接收连接ID
-			conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			buf := make([]byte, 8)
 			n, err := io.ReadFull(conn, buf)
 			if err != nil || n != 8 {
@@ -181,7 +197,6 @@ func (p *Pool) ClientManager() {
 			id = string(buf[:n])
 			conn.SetReadDeadline(time.Time{})
 
-			<-time.After(time.Second)
 			select {
 			case p.idChan <- id:
 				p.conns.Store(id, conn)
@@ -218,7 +233,7 @@ func (p *Pool) ServerManager() {
 			select {
 			case <-p.ctx.Done():
 				return
-			case <-time.After(50 * time.Millisecond):
+			case <-time.After(acceptRetryInterval):
 			}
 			continue
 		}
@@ -436,15 +451,15 @@ func (p *Pool) removeID(id string) {
 func (p *Pool) adjustInterval() {
 	idle := len(p.idChan)
 
-	if idle < p.capacity*2/10 && p.interval > p.minIvl {
-		p.interval -= 100 * time.Millisecond
+	if idle < int(float64(p.capacity)*intervalLowThreshold) && p.interval > p.minIvl {
+		p.interval -= intervalAdjustStep
 		if p.interval < p.minIvl {
 			p.interval = p.minIvl
 		}
 	}
 
-	if idle > p.capacity*8/10 && p.interval < p.maxIvl {
-		p.interval += 100 * time.Millisecond
+	if idle > int(float64(p.capacity)*intervalHighThreshold) && p.interval < p.maxIvl {
+		p.interval += intervalAdjustStep
 		if p.interval > p.maxIvl {
 			p.interval = p.maxIvl
 		}
@@ -455,11 +470,11 @@ func (p *Pool) adjustInterval() {
 func (p *Pool) adjustCapacity(created int) {
 	ratio := float64(created) / float64(p.capacity)
 
-	if ratio < 0.2 && p.capacity > p.minCap {
+	if ratio < capacityAdjustLowRatio && p.capacity > p.minCap {
 		p.capacity--
 	}
 
-	if ratio > 0.8 && p.capacity < p.maxCap {
+	if ratio > capacityAdjustHighRatio && p.capacity < p.maxCap {
 		p.capacity++
 	}
 }
@@ -469,7 +484,7 @@ func (p *Pool) drainConn(conn net.Conn) bool {
 	conn.SetReadDeadline(time.Now().Add(p.keepAlive))
 	defer conn.SetReadDeadline(time.Time{})
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, drainBufferSize)
 
 	for {
 		n, err := conn.Read(buf)
@@ -487,7 +502,7 @@ func (p *Pool) drainConn(conn net.Conn) bool {
 
 // isActive 检查连接是否处于活跃状态
 func (p *Pool) isActive(conn net.Conn) bool {
-	if err := conn.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(activeCheckTimeout)); err != nil {
 		return false
 	}
 
