@@ -188,13 +188,13 @@ func (p *Pool) ClientManager() {
 
 			// 接收连接ID
 			conn.SetReadDeadline(time.Now().Add(readTimeout))
-			buf := make([]byte, 8)
+			buf := make([]byte, 4)
 			n, err := io.ReadFull(conn, buf)
-			if err != nil || n != 8 {
+			if err != nil || n != 4 {
 				conn.Close()
 				continue
 			}
-			id = string(buf[:n])
+			id = hex.EncodeToString(buf)
 			conn.SetReadDeadline(time.Time{})
 
 			select {
@@ -259,14 +259,21 @@ func (p *Pool) ServerManager() {
 		}
 
 		// 生成连接ID
-		id := p.getID()
+		rawID := make([]byte, 4)
+		if _, err = rand.Read(rawID); err != nil {
+			conn.Close()
+			continue
+		}
+		id := hex.EncodeToString(rawID)
+
+		// 防止重复连接ID
 		if _, exist := p.conns.Load(id); exist {
 			conn.Close()
 			continue
 		}
 
-		// 发送连接ID
-		_, err = conn.Write([]byte(id))
+		// 发送连接ID原始字节
+		_, err = conn.Write(rawID)
 		if err != nil {
 			conn.Close()
 			continue
@@ -417,13 +424,6 @@ func (p *Pool) ResetError() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.errCount = 0
-}
-
-// getID 生成唯一的连接ID
-func (p *Pool) getID() string {
-	bytes := make([]byte, 4)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
 }
 
 // removeID 从ID通道中移除指定ID
