@@ -298,14 +298,10 @@ func (p *Pool) ClientGet(id string, timeout time.Duration) (net.Conn, error) {
 		case <-time.After(timeout):
 			return nil, fmt.Errorf("pool connection not found")
 		default:
-			p.mu.Lock()
 			conn, ok := p.conns.LoadAndDelete(id)
 			if ok {
-				p.removeID(id)
-				p.mu.Unlock()
 				return conn.(net.Conn), nil
 			}
-			p.mu.Unlock()
 			select {
 			case <-p.ctx.Done():
 				return nil, p.ctx.Err()
@@ -459,27 +455,6 @@ func (p *Pool) ResetError() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.errCount = 0
-}
-
-// removeID 从ID通道中移除指定ID
-func (p *Pool) removeID(id string) {
-	var wg sync.WaitGroup
-	tmpChan := make(chan string, p.maxCap)
-
-	for {
-		select {
-		case tmp := <-p.idChan:
-			wg.Go(func() {
-				if tmp != id {
-					tmpChan <- tmp
-				}
-			})
-		default:
-			wg.Wait()
-			p.idChan = tmpChan
-			return
-		}
-	}
 }
 
 // adjustInterval 根据连接池使用情况动态调整连接创建间隔
