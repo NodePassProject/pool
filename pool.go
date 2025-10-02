@@ -209,7 +209,14 @@ func (p *Pool) ClientManager() {
 
 		p.adjustCapacity(created)
 		mu.Unlock()
-		time.Sleep(p.interval)
+
+		p.cleanOnce()
+
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-time.After(p.interval):
+		}
 	}
 }
 
@@ -286,6 +293,8 @@ func (p *Pool) ServerManager() {
 			p.conns.Delete(id)
 			conn.Close()
 		}
+
+		p.cleanOnce()
 	}
 }
 
@@ -525,4 +534,21 @@ func (p *Pool) isActive(conn net.Conn) bool {
 	}
 
 	return true
+}
+
+// cleanOnce ID通道清洗
+func (p *Pool) cleanOnce() {
+	for {
+		select {
+		case id := <-p.idChan:
+			if _, ok := p.conns.Load(id); ok {
+				select {
+				case p.idChan <- id:
+				default:
+				}
+			}
+		default:
+			return
+		}
+	}
 }
