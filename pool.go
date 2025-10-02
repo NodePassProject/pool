@@ -165,8 +165,7 @@ func (p *Pool) ClientManager() {
 					InsecureSkipVerify: true,
 					MinVersion:         tls.VersionTLS13,
 				})
-				err := tlsConn.Handshake()
-				if err != nil {
+				if err := tlsConn.Handshake(); err != nil {
 					conn.Close()
 					continue
 				}
@@ -178,8 +177,7 @@ func (p *Pool) ClientManager() {
 					MinVersion:         tls.VersionTLS13,
 					ServerName:         p.hostname,
 				})
-				err := tlsConn.Handshake()
-				if err != nil {
+				if err := tlsConn.Handshake(); err != nil {
 					conn.Close()
 					continue
 				}
@@ -197,11 +195,13 @@ func (p *Pool) ClientManager() {
 			id = hex.EncodeToString(buf)
 			conn.SetReadDeadline(time.Time{})
 
+			// 建立映射并存入通道
+			p.conns.Store(id, conn)
 			select {
 			case p.idChan <- id:
-				p.conns.Store(id, conn)
 				created++
 			default:
+				p.conns.Delete(id)
 				conn.Close()
 			}
 		}
@@ -250,8 +250,7 @@ func (p *Pool) ServerManager() {
 		// 应用TLS（如果配置）
 		if p.tlsConfig != nil {
 			tlsConn := tls.Server(conn, p.tlsConfig)
-			err := tlsConn.Handshake()
-			if err != nil {
+			if err := tlsConn.Handshake(); err != nil {
 				conn.Close()
 				continue
 			}
@@ -273,16 +272,17 @@ func (p *Pool) ServerManager() {
 		}
 
 		// 发送连接ID原始字节
-		_, err = conn.Write(rawID)
-		if err != nil {
+		if _, err = conn.Write(rawID); err != nil {
 			conn.Close()
 			continue
 		}
 
+		// 建立映射并存入通道
+		p.conns.Store(id, conn)
 		select {
 		case p.idChan <- id:
-			p.conns.Store(id, conn)
 		default:
+			p.conns.Delete(id)
 			conn.Close()
 		}
 	}
@@ -355,6 +355,25 @@ func (p *Pool) Put(id string, conn net.Conn) {
 			return
 		}
 	}()
+}
+
+// Clean 清理池连接中的闲置连接
+func (p *Pool) Clean() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for {
+		select {
+		case id := <-p.idChan:
+			if conn, ok := p.conns.LoadAndDelete(id); ok {
+				if conn != nil {
+					conn.(net.Conn).Close()
+				}
+			}
+		default:
+			return
+		}
+	}
 }
 
 // Flush 清空连接池中的所有连接
@@ -506,11 +525,13 @@ func (p *Pool) isActive(conn net.Conn) bool {
 		return false
 	}
 
-	_, err := conn.Write([]byte{})
+	if _, err := conn.Write([]byte{}); err != nil {
+		return false
+	}
 
 	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
 		return false
 	}
 
-	return err == nil
+	return true
 }
