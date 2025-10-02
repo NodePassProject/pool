@@ -131,6 +131,8 @@ func (p *Pool) ClientManager() {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+
+	go p.idCleanLoop()
 	var mu sync.Mutex
 
 	for {
@@ -210,8 +212,6 @@ func (p *Pool) ClientManager() {
 		p.adjustCapacity(created)
 		mu.Unlock()
 
-		p.cleanOnce()
-
 		select {
 		case <-p.ctx.Done():
 			return
@@ -226,6 +226,8 @@ func (p *Pool) ServerManager() {
 		p.cancel()
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+
+	go p.idCleanLoop()
 
 	for {
 		if p.ctx.Err() != nil {
@@ -293,8 +295,6 @@ func (p *Pool) ServerManager() {
 			p.conns.Delete(id)
 			conn.Close()
 		}
-
-		p.cleanOnce()
 	}
 }
 
@@ -307,9 +307,14 @@ func (p *Pool) ClientGet(id string, timeout time.Duration) (net.Conn, error) {
 		case <-time.After(timeout):
 			return nil, fmt.Errorf("pool connection not found")
 		default:
-			conn, ok := p.conns.LoadAndDelete(id)
-			if ok {
-				return conn.(net.Conn), nil
+			if conn, ok := p.conns.LoadAndDelete(id); ok {
+				netConn := conn.(net.Conn)
+				if p.isActive(netConn) {
+					return netConn, nil
+				} else {
+					netConn.Close()
+					return nil, fmt.Errorf("pool connection is inactive")
+				}
 			}
 			select {
 			case <-p.ctx.Done():
@@ -331,8 +336,10 @@ func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn, error) {
 				netConn := conn.(net.Conn)
 				if p.isActive(netConn) {
 					return id, netConn, nil
+				} else {
+					netConn.Close()
+					return "", nil, fmt.Errorf("pool connection is inactive")
 				}
-				netConn.Close()
 			}
 		case <-time.After(timeout):
 			return "", nil, fmt.Errorf("insufficient pool connections")
@@ -536,19 +543,25 @@ func (p *Pool) isActive(conn net.Conn) bool {
 	return true
 }
 
-// cleanOnce ID通道清洗
-func (p *Pool) cleanOnce() {
+// idCleanLoop 循环清理池中无效ID
+func (p *Pool) idCleanLoop() {
 	for {
+		if p.ctx.Err() != nil {
+			return
+		}
+
 		select {
 		case id := <-p.idChan:
 			if _, ok := p.conns.Load(id); ok {
-				select {
-				case p.idChan <- id:
-				default:
-				}
+				p.idChan <- id
+			}
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(idRetryInterval):
+				continue
 			}
 		default:
-			return
 		}
 	}
 }
