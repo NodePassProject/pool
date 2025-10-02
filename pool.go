@@ -18,7 +18,8 @@ const (
 	defaultMaxCap           = 1
 	defaultMinIvl           = time.Second
 	defaultMaxIvl           = time.Second
-	readTimeout             = 20 * time.Second
+	idRetryInterval         = 10 * time.Millisecond
+	idReadTimeout           = 50 * time.Second
 	acceptRetryInterval     = 50 * time.Millisecond
 	intervalAdjustStep      = 100 * time.Millisecond
 	capacityAdjustLowRatio  = 0.2
@@ -185,7 +186,7 @@ func (p *Pool) ClientManager() {
 			}
 
 			// 接收连接ID
-			conn.SetReadDeadline(time.Now().Add(readTimeout))
+			conn.SetReadDeadline(time.Now().Add(idReadTimeout))
 			buf := make([]byte, 4)
 			n, err := io.ReadFull(conn, buf)
 			if err != nil || n != 4 {
@@ -289,14 +290,29 @@ func (p *Pool) ServerManager() {
 }
 
 // ClientGet 获取指定ID的客户端连接
-func (p *Pool) ClientGet(id string) (net.Conn, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if conn, ok := p.conns.LoadAndDelete(id); ok {
-		p.removeID(id)
-		return conn.(net.Conn), nil
+func (p *Pool) ClientGet(id string, timeout time.Duration) (net.Conn, error) {
+	for {
+		select {
+		case <-p.ctx.Done():
+			return nil, p.ctx.Err()
+		case <-time.After(timeout):
+			return nil, fmt.Errorf("pool connection not found")
+		default:
+			p.mu.Lock()
+			conn, ok := p.conns.LoadAndDelete(id)
+			if ok {
+				p.removeID(id)
+				p.mu.Unlock()
+				return conn.(net.Conn), nil
+			}
+			p.mu.Unlock()
+			select {
+			case <-p.ctx.Done():
+				return nil, p.ctx.Err()
+			case <-time.After(idRetryInterval):
+			}
+		}
 	}
-	return nil, fmt.Errorf("pool connection not found")
 }
 
 // ServerGet 获取一个可用的服务器连接及其ID
