@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,7 +33,6 @@ const (
 
 // Pool 连接池结构体，用于管理多个网络连接
 type Pool struct {
-	mu        sync.Mutex               // 互斥锁，保护共享资源访问
 	conns     sync.Map                 // 存储连接的映射表
 	idChan    chan string              // 可用ID通道
 	tlsCode   string                   // TLS安全模式代码
@@ -41,11 +41,11 @@ type Pool struct {
 	tlsConfig *tls.Config              // TLS配置
 	dialer    func() (net.Conn, error) // 创建连接的函数
 	listener  net.Listener             // 监听器
-	errCount  int                      // 错误计数
-	capacity  int                      // 当前容量
+	errCount  atomic.Int32             // 错误计数
+	capacity  atomic.Int32             // 当前容量
 	minCap    int                      // 最小容量
 	maxCap    int                      // 最大容量
-	interval  time.Duration            // 连接创建间隔
+	interval  atomic.Int64             // 连接创建间隔
 	minIvl    time.Duration            // 最小间隔
 	maxIvl    time.Duration            // 最大间隔
 	keepAlive time.Duration            // 保活间隔
@@ -82,23 +82,25 @@ func NewClientPool(
 		minIvl, maxIvl = maxIvl, minIvl
 	}
 
-	return &Pool{
+	pool := &Pool{
 		conns:     sync.Map{},
 		idChan:    make(chan string, maxCap),
 		tlsCode:   tlsCode,
 		hostname:  hostname,
 		dialer:    dialer,
-		capacity:  minCap,
 		minCap:    minCap,
 		maxCap:    maxCap,
-		interval:  minIvl,
 		minIvl:    minIvl,
 		maxIvl:    maxIvl,
 		keepAlive: keepAlive,
 	}
+	pool.capacity.Store(int32(minCap))
+	pool.interval.Store(int64(minIvl))
+	pool.ctx, pool.cancel = context.WithCancel(context.Background())
+	return pool
 }
 
-// NewServerPool 创建新的服务器连接池
+// NewServerPool 创建新的服务端连接池
 func NewServerPool(
 	maxCap int,
 	clientIP string,
@@ -114,7 +116,7 @@ func NewServerPool(
 		return nil
 	}
 
-	return &Pool{
+	pool := &Pool{
 		conns:     sync.Map{},
 		idChan:    make(chan string, maxCap),
 		clientIP:  clientIP,
@@ -123,9 +125,129 @@ func NewServerPool(
 		maxCap:    maxCap,
 		keepAlive: keepAlive,
 	}
+	pool.ctx, pool.cancel = context.WithCancel(context.Background())
+	return pool
 }
 
-// ClientManager 客户端连接池管理器，负责创建和维护客户端连接
+// createConnection 创建新的客户端连接
+func (p *Pool) createConnection() bool {
+	conn, err := p.dialer()
+	if err != nil {
+		return false
+	}
+
+	conn.(*net.TCPConn).SetKeepAlive(true)
+	conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
+
+	var id string
+	// 根据TLS代码应用不同级别的TLS安全
+	switch p.tlsCode {
+	case "0":
+		// 不使用TLS
+	case "1":
+		// 使用自签名证书（不验证）
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS13,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return false
+		}
+		conn = tlsConn
+	case "2":
+		// 使用验证证书（安全模式）
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: false,
+			MinVersion:         tls.VersionTLS13,
+			ServerName:         p.hostname,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return false
+		}
+		conn = tlsConn
+	}
+
+	// 接收连接ID
+	conn.SetReadDeadline(time.Now().Add(idReadTimeout))
+	buf := make([]byte, 4)
+	n, err := io.ReadFull(conn, buf)
+	if err != nil || n != 4 {
+		conn.Close()
+		return false
+	}
+	id = hex.EncodeToString(buf)
+	conn.SetReadDeadline(time.Time{})
+
+	// 建立映射并存入通道
+	p.conns.Store(id, conn)
+	select {
+	case p.idChan <- id:
+		return true
+	default:
+		p.conns.Delete(id)
+		conn.Close()
+		return false
+	}
+}
+
+// handleConnection 处理新的服务端连接
+func (p *Pool) handleConnection(conn net.Conn) {
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+
+	conn.(*net.TCPConn).SetKeepAlive(true)
+	conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
+
+	// 验证客户端IP
+	if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
+		return
+	}
+
+	// 应用TLS
+	if p.tlsConfig != nil {
+		tlsConn := tls.Server(conn, p.tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			return
+		}
+		conn = tlsConn
+	}
+
+	// 生成连接ID
+	rawID := make([]byte, 4)
+	if _, err := rand.Read(rawID); err != nil {
+		return
+	}
+	id := hex.EncodeToString(rawID)
+
+	// 防止重复连接ID
+	if _, exist := p.conns.Load(id); exist {
+		return
+	}
+
+	// 发送ID给客户端并在成功后建立映射
+	if _, err := conn.Write(rawID); err != nil {
+		return
+	}
+
+	// 建立映射
+	p.conns.Store(id, conn)
+
+	// 尝试放入idChan
+	select {
+	case p.idChan <- id:
+		conn = nil
+	default:
+		p.conns.Delete(id)
+		return
+	}
+}
+
+// ClientManager 客户端连接池管理器
 func (p *Pool) ClientManager() {
 	if p.cancel != nil {
 		p.cancel()
@@ -133,94 +255,41 @@ func (p *Pool) ClientManager() {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	go p.idCleanLoop()
-	var mu sync.Mutex
 
-	for {
-		if p.ctx.Err() != nil {
-			return
-		}
-
-		if !mu.TryLock() {
-			continue
-		}
-
+	for p.ctx.Err() == nil {
 		p.adjustInterval()
+		capacity := int(p.capacity.Load())
+		need := capacity - len(p.idChan)
 		created := 0
 
-		// 填充连接池至目标容量
-		for len(p.idChan) < p.capacity {
-			conn, err := p.dialer()
-			if err != nil {
-				continue
-			}
-
-			conn.(*net.TCPConn).SetKeepAlive(true)
-			conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
-
-			var id string
-			// 根据TLS代码应用不同级别的TLS安全
-			switch p.tlsCode {
-			case "0":
-				// 不使用TLS
-			case "1":
-				// 使用自签名证书（不验证）
-				tlsConn := tls.Client(conn, &tls.Config{
-					InsecureSkipVerify: true,
-					MinVersion:         tls.VersionTLS13,
+		if need > 0 {
+			var wg sync.WaitGroup
+			results := make(chan int, need)
+			for range need {
+				wg.Go(func() {
+					if p.createConnection() {
+						results <- 1
+					}
 				})
-				if err := tlsConn.Handshake(); err != nil {
-					conn.Close()
-					continue
-				}
-				conn = tlsConn
-			case "2":
-				// 使用验证证书（安全模式）
-				tlsConn := tls.Client(conn, &tls.Config{
-					InsecureSkipVerify: false,
-					MinVersion:         tls.VersionTLS13,
-					ServerName:         p.hostname,
-				})
-				if err := tlsConn.Handshake(); err != nil {
-					conn.Close()
-					continue
-				}
-				conn = tlsConn
 			}
-
-			// 接收连接ID
-			conn.SetReadDeadline(time.Now().Add(idReadTimeout))
-			buf := make([]byte, 4)
-			n, err := io.ReadFull(conn, buf)
-			if err != nil || n != 4 {
-				conn.Close()
-				continue
-			}
-			id = hex.EncodeToString(buf)
-			conn.SetReadDeadline(time.Time{})
-
-			// 建立映射并存入通道
-			p.conns.Store(id, conn)
-			select {
-			case p.idChan <- id:
-				created++
-			default:
-				p.conns.Delete(id)
-				conn.Close()
+			wg.Wait()
+			close(results)
+			for r := range results {
+				created += r
 			}
 		}
 
 		p.adjustCapacity(created)
-		mu.Unlock()
 
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-time.After(p.interval):
+		case <-time.After(time.Duration(p.interval.Load())):
 		}
 	}
 }
 
-// ServerManager 服务器连接池管理器，负责接受和管理新连接
+// ServerManager 服务端连接池管理器
 func (p *Pool) ServerManager() {
 	if p.cancel != nil {
 		p.cancel()
@@ -229,11 +298,7 @@ func (p *Pool) ServerManager() {
 
 	go p.idCleanLoop()
 
-	for {
-		if p.ctx.Err() != nil {
-			return
-		}
-
+	for p.ctx.Err() == nil {
 		conn, err := p.listener.Accept()
 		if err != nil {
 			if p.ctx.Err() != nil || err == net.ErrClosed {
@@ -248,64 +313,18 @@ func (p *Pool) ServerManager() {
 			continue
 		}
 
-		conn.(*net.TCPConn).SetKeepAlive(true)
-		conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
-
-		// 验证客户端IP（如果指定）
-		if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
-			conn.Close()
-			continue
-		}
-
-		// 应用TLS（如果配置）
-		if p.tlsConfig != nil {
-			tlsConn := tls.Server(conn, p.tlsConfig)
-			if err := tlsConn.Handshake(); err != nil {
-				conn.Close()
-				continue
-			}
-			conn = tlsConn
-		}
-
-		// 生成连接ID
-		rawID := make([]byte, 4)
-		if _, err = rand.Read(rawID); err != nil {
-			conn.Close()
-			continue
-		}
-		id := hex.EncodeToString(rawID)
-
-		// 防止重复连接ID
-		if _, exist := p.conns.Load(id); exist {
-			conn.Close()
-			continue
-		}
-
-		// 发送连接ID原始字节
-		if _, err = conn.Write(rawID); err != nil {
-			conn.Close()
-			continue
-		}
-
-		// 建立映射并存入通道
-		p.conns.Store(id, conn)
-		select {
-		case p.idChan <- id:
-		default:
-			p.conns.Delete(id)
-			conn.Close()
-		}
+		go p.handleConnection(conn)
 	}
 }
 
-// ClientGet 获取指定ID的客户端连接
-func (p *Pool) ClientGet(id string, timeout time.Duration) (net.Conn, error) {
+// OutgoingGet 根据ID获取可用池连接
+func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	for {
 		select {
 		case <-p.ctx.Done():
 			return nil, p.ctx.Err()
 		case <-time.After(timeout):
-			return nil, fmt.Errorf("pool connection not found")
+			return nil, fmt.Errorf("OutgoingGet: pool connection not found")
 		default:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
 				netConn := conn.(net.Conn)
@@ -313,7 +332,7 @@ func (p *Pool) ClientGet(id string, timeout time.Duration) (net.Conn, error) {
 					return netConn, nil
 				} else {
 					netConn.Close()
-					return nil, fmt.Errorf("pool connection is inactive")
+					return nil, fmt.Errorf("OutgoingGet: pool connection is inactive")
 				}
 			}
 			select {
@@ -325,8 +344,8 @@ func (p *Pool) ClientGet(id string, timeout time.Duration) (net.Conn, error) {
 	}
 }
 
-// ServerGet 获取一个可用的服务器连接及其ID
-func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn, error) {
+// IncomingGet 获取可用池连接返回ID
+func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -338,11 +357,11 @@ func (p *Pool) ServerGet(timeout time.Duration) (string, net.Conn, error) {
 					return id, netConn, nil
 				} else {
 					netConn.Close()
-					return "", nil, fmt.Errorf("pool connection is inactive")
+					return "", nil, fmt.Errorf("IncomingGet: pool connection is inactive")
 				}
 			}
 		case <-time.After(timeout):
-			return "", nil, fmt.Errorf("insufficient pool connections")
+			return "", nil, fmt.Errorf("IncomingGet: insufficient pool connections")
 		}
 	}
 }
@@ -368,7 +387,7 @@ func (p *Pool) Put(id string, conn net.Conn) {
 	// 防止立即复用导致竞态
 	go func() {
 		select {
-		case <-time.After(p.interval):
+		case <-time.After(time.Duration(p.interval.Load())):
 			select {
 			case p.idChan <- id:
 				// 成功放回连接池
@@ -387,9 +406,6 @@ func (p *Pool) Put(id string, conn net.Conn) {
 
 // Clean 清理池连接中的闲置连接
 func (p *Pool) Clean() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	for {
 		select {
 		case id := <-p.idChan:
@@ -406,9 +422,6 @@ func (p *Pool) Clean() {
 
 // Flush 清空连接池中的所有连接
 func (p *Pool) Flush() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	var wg sync.WaitGroup
 	p.conns.Range(func(key, value any) bool {
 		wg.Go(func() {
@@ -444,64 +457,57 @@ func (p *Pool) Active() int {
 
 // Capacity 获取当前连接池容量
 func (p *Pool) Capacity() int {
-	return p.capacity
+	return int(p.capacity.Load())
 }
 
 // Interval 获取当前连接创建间隔
 func (p *Pool) Interval() time.Duration {
-	return p.interval
+	return time.Duration(p.interval.Load())
 }
 
 // AddError 增加错误计数
 func (p *Pool) AddError() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.errCount++
+	p.errCount.Add(1)
 }
 
 // ErrorCount 获取错误计数
 func (p *Pool) ErrorCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.errCount
+	return int(p.errCount.Load())
 }
 
 // ResetError 重置错误计数
 func (p *Pool) ResetError() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.errCount = 0
+	p.errCount.Store(0)
 }
 
 // adjustInterval 根据连接池使用情况动态调整连接创建间隔
 func (p *Pool) adjustInterval() {
 	idle := len(p.idChan)
+	capacity := int(p.capacity.Load())
+	interval := time.Duration(p.interval.Load())
 
-	if idle < int(float64(p.capacity)*intervalLowThreshold) && p.interval > p.minIvl {
-		p.interval -= intervalAdjustStep
-		if p.interval < p.minIvl {
-			p.interval = p.minIvl
-		}
+	if idle < int(float64(capacity)*intervalLowThreshold) && interval > p.minIvl {
+		newInterval := max(interval-intervalAdjustStep, p.minIvl)
+		p.interval.Store(int64(newInterval))
 	}
 
-	if idle > int(float64(p.capacity)*intervalHighThreshold) && p.interval < p.maxIvl {
-		p.interval += intervalAdjustStep
-		if p.interval > p.maxIvl {
-			p.interval = p.maxIvl
-		}
+	if idle > int(float64(capacity)*intervalHighThreshold) && interval < p.maxIvl {
+		newInterval := min(interval+intervalAdjustStep, p.maxIvl)
+		p.interval.Store(int64(newInterval))
 	}
 }
 
 // adjustCapacity 根据创建成功率动态调整连接池容量
 func (p *Pool) adjustCapacity(created int) {
-	ratio := float64(created) / float64(p.capacity)
+	capacity := int(p.capacity.Load())
+	ratio := float64(created) / float64(capacity)
 
-	if ratio < capacityAdjustLowRatio && p.capacity > p.minCap {
-		p.capacity--
+	if ratio < capacityAdjustLowRatio && capacity > p.minCap {
+		p.capacity.Add(-1)
 	}
 
-	if ratio > capacityAdjustHighRatio && p.capacity < p.maxCap {
-		p.capacity++
+	if ratio > capacityAdjustHighRatio && capacity < p.maxCap {
+		p.capacity.Add(1)
 	}
 }
 
@@ -546,11 +552,9 @@ func (p *Pool) isActive(conn net.Conn) bool {
 // idCleanLoop 循环清理池中无效ID
 func (p *Pool) idCleanLoop() {
 	for {
-		if p.ctx.Err() != nil {
-			return
-		}
-
 		select {
+		case <-p.ctx.Done():
+			return
 		case id := <-p.idChan:
 			if _, ok := p.conns.Load(id); ok {
 				p.idChan <- id
@@ -561,7 +565,6 @@ func (p *Pool) idCleanLoop() {
 			case <-time.After(idRetryInterval):
 				continue
 			}
-		default:
 		}
 	}
 }
