@@ -200,6 +200,11 @@ func (p *Pool) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// 检查池是否已满
+	if p.Active() >= p.maxCap {
+		return
+	}
+
 	conn.(*net.TCPConn).SetKeepAlive(true)
 	conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
@@ -319,26 +324,23 @@ func (p *Pool) ServerManager() {
 
 // OutgoingGet 根据ID获取可用池连接
 func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(idRetryInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-p.ctx.Done():
 			return nil, p.ctx.Err()
-		case <-time.After(timeout):
+		case <-ctx.Done():
 			return nil, fmt.Errorf("OutgoingGet: pool connection not found")
-		default:
+		case <-ticker.C:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
 				netConn := conn.(net.Conn)
 				if p.isActive(netConn) {
 					return netConn, nil
-				} else {
-					netConn.Close()
-					return nil, fmt.Errorf("OutgoingGet: pool connection is inactive")
 				}
-			}
-			select {
-			case <-p.ctx.Done():
-				return nil, p.ctx.Err()
-			case <-time.After(idRetryInterval):
+				netConn.Close()
 			}
 		}
 	}
@@ -346,22 +348,24 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 
 // IncomingGet 获取可用池连接返回ID
 func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, timeout)
+	defer cancel()
 	for {
 		select {
 		case <-p.ctx.Done():
 			return "", nil, p.ctx.Err()
+		case <-ctx.Done():
+			return "", nil, fmt.Errorf("IncomingGet: insufficient pool connections")
 		case id := <-p.idChan:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
 				netConn := conn.(net.Conn)
 				if p.isActive(netConn) {
 					return id, netConn, nil
-				} else {
-					netConn.Close()
-					return "", nil, fmt.Errorf("IncomingGet: pool connection is inactive")
 				}
+				netConn.Close()
+				continue
 			}
-		case <-time.After(timeout):
-			return "", nil, fmt.Errorf("IncomingGet: insufficient pool connections")
+			continue
 		}
 	}
 }
@@ -551,19 +555,19 @@ func (p *Pool) isActive(conn net.Conn) bool {
 
 // idCleanLoop 循环清理池中无效ID
 func (p *Pool) idCleanLoop() {
+	ticker := time.NewTicker(idRetryInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
-		case id := <-p.idChan:
-			if _, ok := p.conns.Load(id); ok {
-				p.idChan <- id
-			}
+		case <-ticker.C:
 			select {
-			case <-p.ctx.Done():
-				return
-			case <-time.After(idRetryInterval):
-				continue
+			case id := <-p.idChan:
+				if _, ok := p.conns.Load(id); ok {
+					p.idChan <- id
+				}
+			default:
 			}
 		}
 	}
