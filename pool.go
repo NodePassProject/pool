@@ -239,15 +239,13 @@ func (p *Pool) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 建立映射
-	p.conns.Store(id, conn)
-
 	// 尝试放入idChan
 	select {
 	case p.idChan <- id:
+		p.conns.Store(id, conn)
 		conn = nil
 	default:
-		p.conns.Delete(id)
+		// 池满
 		return
 	}
 }
@@ -564,8 +562,14 @@ func (p *Pool) idCleanLoop() {
 		case <-ticker.C:
 			select {
 			case id := <-p.idChan:
-				if _, ok := p.conns.Load(id); ok {
-					p.idChan <- id
+				if conn, ok := p.conns.Load(id); ok {
+					netConn := conn.(net.Conn)
+					if p.isActive(netConn) {
+						p.idChan <- id
+					} else {
+						p.conns.Delete(id)
+						netConn.Close()
+					}
 				}
 			default:
 			}
