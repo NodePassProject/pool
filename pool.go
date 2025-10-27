@@ -19,8 +19,8 @@ const (
 	defaultMaxCap           = 1
 	defaultMinIvl           = time.Second
 	defaultMaxIvl           = time.Second
-	idRetryInterval         = 10 * time.Millisecond
-	idReadTimeout           = 50 * time.Second
+	idReadTimeout           = time.Minute
+	idRetryInterval         = 50 * time.Millisecond
 	acceptRetryInterval     = 50 * time.Millisecond
 	intervalAdjustStep      = 100 * time.Millisecond
 	capacityAdjustLowRatio  = 0.2
@@ -560,12 +560,21 @@ func (p *Pool) idCleanLoop() {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
+			if len(p.idChan) == 0 {
+				continue
+			}
+
 			select {
 			case id := <-p.idChan:
 				if conn, ok := p.conns.Load(id); ok {
 					netConn := conn.(net.Conn)
 					if p.isActive(netConn) {
-						p.idChan <- id
+						select {
+						case p.idChan <- id:
+						default:
+							p.conns.Delete(id)
+							netConn.Close()
+						}
 					} else {
 						p.conns.Delete(id)
 						netConn.Close()
