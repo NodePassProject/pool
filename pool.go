@@ -323,12 +323,7 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	for {
 		if conn, ok := p.conns.LoadAndDelete(id); ok {
 			<-p.idChan
-			netConn := conn.(net.Conn)
-			if p.isActive(netConn) {
-				return netConn, nil
-			}
-			netConn.Close()
-			return nil, fmt.Errorf("OutgoingGet: pool connection inactive")
+			return conn.(net.Conn), nil
 		}
 		select {
 		case <-time.After(idRetryInterval):
@@ -348,12 +343,7 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 			return "", nil, fmt.Errorf("IncomingGet: insufficient pool connections")
 		case id := <-p.idChan:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
-				netConn := conn.(net.Conn)
-				if p.isActive(netConn) {
-					return id, netConn, nil
-				}
-				netConn.Close()
-				continue
+				return id, conn.(net.Conn), nil
 			}
 			continue
 		}
@@ -524,21 +514,4 @@ func (p *Pool) drainConn(conn net.Conn) bool {
 			return false
 		}
 	}
-}
-
-// isActive 检查连接是否处于活跃状态
-func (p *Pool) isActive(conn net.Conn) bool {
-	if err := conn.SetWriteDeadline(time.Now().Add(activeCheckTimeout)); err != nil {
-		return false
-	}
-
-	if _, err := conn.Write([]byte{}); err != nil {
-		return false
-	}
-
-	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
-		return false
-	}
-
-	return true
 }
