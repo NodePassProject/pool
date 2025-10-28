@@ -320,21 +320,20 @@ func (p *Pool) ServerManager() {
 func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
-	ticker := time.NewTicker(idRetryInterval)
-	defer ticker.Stop()
 	for {
+		if conn, ok := p.conns.LoadAndDelete(id); ok {
+			<-p.idChan
+			netConn := conn.(net.Conn)
+			if p.isActive(netConn) {
+				return netConn, nil
+			}
+			netConn.Close()
+			return nil, fmt.Errorf("OutgoingGet: pool connection inactive")
+		}
 		select {
+		case <-time.After(idRetryInterval):
 		case <-ctx.Done():
 			return nil, fmt.Errorf("OutgoingGet: pool connection not found")
-		case <-ticker.C:
-			if conn, ok := p.conns.LoadAndDelete(id); ok {
-				netConn := conn.(net.Conn)
-				if p.isActive(netConn) {
-					<-p.idChan
-					return netConn, nil
-				}
-				netConn.Close()
-			}
 		}
 	}
 }
