@@ -257,8 +257,6 @@ func (p *Pool) ClientManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	go p.idCleanLoop()
-
 	for p.ctx.Err() == nil {
 		p.adjustInterval()
 		capacity := int(p.capacity.Load())
@@ -299,8 +297,6 @@ func (p *Pool) ServerManager() {
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	go p.idCleanLoop()
-
 	for p.ctx.Err() == nil {
 		conn, err := p.listener.Accept()
 		if err != nil {
@@ -328,14 +324,13 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-p.ctx.Done():
-			return nil, p.ctx.Err()
 		case <-ctx.Done():
 			return nil, fmt.Errorf("OutgoingGet: pool connection not found")
 		case <-ticker.C:
 			if conn, ok := p.conns.LoadAndDelete(id); ok {
 				netConn := conn.(net.Conn)
 				if p.isActive(netConn) {
+					<-p.idChan
 					return netConn, nil
 				}
 				netConn.Close()
@@ -350,8 +345,6 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	defer cancel()
 	for {
 		select {
-		case <-p.ctx.Done():
-			return "", nil, p.ctx.Err()
 		case <-ctx.Done():
 			return "", nil, fmt.Errorf("IncomingGet: insufficient pool connections")
 		case id := <-p.idChan:
@@ -549,39 +542,4 @@ func (p *Pool) isActive(conn net.Conn) bool {
 	}
 
 	return true
-}
-
-// idCleanLoop 循环清理池中无效ID
-func (p *Pool) idCleanLoop() {
-	ticker := time.NewTicker(idRetryInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-ticker.C:
-			if len(p.idChan) == 0 {
-				continue
-			}
-
-			select {
-			case id := <-p.idChan:
-				if conn, ok := p.conns.Load(id); ok {
-					netConn := conn.(net.Conn)
-					if p.isActive(netConn) {
-						select {
-						case p.idChan <- id:
-						default:
-							p.conns.Delete(id)
-							netConn.Close()
-						}
-					} else {
-						p.conns.Delete(id)
-						netConn.Close()
-					}
-				}
-			default:
-			}
-		}
-	}
 }
