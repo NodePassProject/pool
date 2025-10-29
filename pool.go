@@ -17,9 +17,9 @@ import (
 const (
 	defaultMinCap           = 1
 	defaultMaxCap           = 1
-	defaultMinIvl           = time.Second
-	defaultMaxIvl           = time.Second
-	idReadTimeout           = time.Minute
+	defaultMinIvl           = 1 * time.Second
+	defaultMaxIvl           = 1 * time.Second
+	idReadTimeout           = 1 * time.Minute
 	idRetryInterval         = 50 * time.Millisecond
 	acceptRetryInterval     = 50 * time.Millisecond
 	intervalAdjustStep      = 100 * time.Millisecond
@@ -27,8 +27,6 @@ const (
 	capacityAdjustHighRatio = 0.8
 	intervalLowThreshold    = 0.2
 	intervalHighThreshold   = 0.8
-	drainBufferSize         = 2048
-	activeCheckTimeout      = 20 * time.Millisecond
 )
 
 // Pool 连接池结构体，用于管理多个网络连接
@@ -350,44 +348,6 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	}
 }
 
-// Put 将连接放回连接池
-func (p *Pool) Put(id string, conn net.Conn) {
-	if id == "" || conn == nil {
-		return
-	}
-
-	// 清空连接残留数据
-	if !p.drainConn(conn) {
-		conn.Close()
-		return
-	}
-
-	// 防止重复放回
-	if _, loaded := p.conns.LoadOrStore(id, conn); loaded {
-		conn.Close()
-		return
-	}
-
-	// 防止立即复用导致竞态
-	go func() {
-		select {
-		case <-time.After(time.Duration(p.interval.Load())):
-			select {
-			case p.idChan <- id:
-				// 成功放回连接池
-			default:
-				// 池满，除名并关闭连接
-				p.conns.Delete(id)
-				conn.Close()
-			}
-		case <-p.ctx.Done():
-			p.conns.Delete(id)
-			conn.Close()
-			return
-		}
-	}()
-}
-
 // Clean 清理池连接中的闲置连接
 func (p *Pool) Clean() {
 	for {
@@ -492,26 +452,5 @@ func (p *Pool) adjustCapacity(created int) {
 
 	if ratio > capacityAdjustHighRatio && capacity < p.maxCap {
 		p.capacity.Add(1)
-	}
-}
-
-// drainConn 清空连接中的残留数据
-func (p *Pool) drainConn(conn net.Conn) bool {
-	conn.SetReadDeadline(time.Now().Add(p.keepAlive))
-	defer conn.SetReadDeadline(time.Time{})
-
-	buf := make([]byte, drainBufferSize)
-
-	for {
-		n, err := conn.Read(buf)
-		if n == 0 || err != nil {
-			if err == nil {
-				return true
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				return true
-			}
-			return false
-		}
 	}
 }
