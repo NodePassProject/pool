@@ -20,7 +20,6 @@ A high-performance, reliable network connection pool management system for Go ap
   - [TLS Security Modes](#tls-security-modes)
 - [Connection Keep-Alive](#connection-keep-alive)
 - [Dynamic Adjustment](#dynamic-adjustment)
-- [Connection Cleanup](#connection-cleanup)
 - [Advanced Usage](#advanced-usage)
 - [Performance Considerations](#performance-considerations)
 - [Troubleshooting](#troubleshooting)
@@ -46,7 +45,6 @@ A high-performance, reliable network connection pool management system for Go ap
 - **Configurable connection creation intervals**
 - **Auto-reconnection with exponential backoff**
 - **Connection activity validation**
-- **Safe cleanup of idle connections**
 
 ## Installation
 
@@ -259,10 +257,6 @@ capacity := clientPool.Capacity()
 // Get current connection creation interval
 interval := clientPool.Interval()
 
-// Clean idle connections from the pool
-// Only removes connections that are available (not in use)
-clientPool.Clean()
-
 // Manually flush all connections (rarely needed)
 clientPool.Flush()
 
@@ -349,12 +343,6 @@ clientPool := pool.NewClientPool(5, 20, minIvl, maxIvl, keepAlive, "2", "example
   - Takes timeout parameter to wait for connection availability.
   - Returns the connection ID and connection object for further use.
 
-- **Clean Method:**
-  - Safely removes only idle connections from the pool.
-  - Thread-safe with mutex protection.
-  - Does not affect connections currently in use.
-  - Useful for regular maintenance and reducing pool size.
-
 - **Flush/Close:**
   - `Flush` closes all connections and resets the pool.
   - `Close` cancels the context and flushes the pool.
@@ -434,86 +422,6 @@ These adjustments ensure optimal resource usage:
 currentCapacity := clientPool.Capacity()
 currentInterval := clientPool.Interval()
 ```
-
-## Connection Cleanup
-
-### Clean Method
-
-The `Clean()` method provides a safe way to remove idle connections from the pool without affecting connections currently in use.
-
-#### How It Works
-
-```go
-// Clean all idle connections from the pool
-clientPool.Clean()
-```
-
-**Key Features:**
-- **Safe for concurrent use**: Only removes connections that are available in the idle pool
-- **No interruption**: Connections currently in use (checked out via `Get`) are not affected
-- **Thread-safe**: Uses mutex protection to prevent race conditions
-- **Non-blocking**: Returns immediately after cleaning all idle connections
-
-#### When to Use Clean
-
-| Scenario | Reason | Frequency |
-|----------|--------|-----------|
-| **Connection pool maintenance** | Remove stale or inactive connections | Periodic (e.g., every 5-10 minutes) |
-| **After error spikes** | Clear potentially problematic connections | After resolving issues |
-| **Before scaling down** | Reduce pool size gracefully | On-demand |
-| **Memory pressure** | Free up resources quickly | When memory is constrained |
-
-#### Usage Examples
-
-**Periodic Cleanup:**
-```go
-// Run periodic cleanup in a background goroutine
-go func() {
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
-    
-    for range ticker.C {
-        clientPool.Clean()
-        log.Printf("Pool cleaned, active connections: %d", clientPool.Active())
-    }
-}()
-```
-
-**Cleanup After High Error Rate:**
-```go
-// Monitor and clean after errors
-if clientPool.ErrorCount() > 50 {
-    log.Println("High error count detected, cleaning pool")
-    clientPool.Clean()
-    clientPool.ResetError()
-}
-```
-
-**On-Demand Cleanup:**
-```go
-// Manual cleanup when needed
-func handleMaintenanceRequest(w http.ResponseWriter, r *http.Request) {
-    clientPool.Clean()
-    fmt.Fprintf(w, "Pool cleaned successfully")
-}
-```
-
-#### Clean vs Flush
-
-| Method | Behavior | Use Case |
-|--------|----------|----------|
-| `Clean()` | Removes only idle connections | Regular maintenance, safe cleanup |
-| `Flush()` | Removes ALL connections | Emergency reset, shutdown preparation |
-
-```go
-// Clean: Safe for ongoing operations
-clientPool.Clean()  // Removes idle connections, active ones continue working
-
-// Flush: Disruptive, closes everything
-clientPool.Flush()  // Closes ALL connections, including active ones
-```
-
-**Best Practice:** Use `Clean()` for regular maintenance and `Flush()` only when you need to completely reset the pool or before shutdown.
 
 ## Advanced Usage
 
@@ -844,42 +752,6 @@ if conn == nil {
 ```
 
 ### 3. Error Handling and Monitoring
-
-#### Implement Periodic Cleanup
-```go
-type PoolManager struct {
-    pool        *pool.Pool
-    cleanTicker *time.Ticker
-    logger      *log.Logger
-}
-
-func (pm *PoolManager) startPeriodicCleanup() {
-    pm.cleanTicker = time.NewTicker(5 * time.Minute)
-    
-    go func() {
-        for range pm.cleanTicker.C {
-            beforeCount := pm.pool.Active()
-            pm.pool.Clean()
-            afterCount := pm.pool.Active()
-            
-            cleaned := beforeCount - afterCount
-            pm.logger.Printf("Pool cleanup: removed %d idle connections, %d remaining", 
-                cleaned, afterCount)
-            
-            // Alert if too many connections were cleaned
-            if cleaned > beforeCount/2 && beforeCount > 0 {
-                pm.logger.Printf("WARNING: Cleaned more than 50%% of connections")
-            }
-        }
-    }()
-}
-
-func (pm *PoolManager) stopPeriodicCleanup() {
-    if pm.cleanTicker != nil {
-        pm.cleanTicker.Stop()
-    }
-}
-```
 
 #### Implement Comprehensive Error Tracking
 ```go

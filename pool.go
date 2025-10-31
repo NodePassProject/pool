@@ -348,22 +348,6 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	}
 }
 
-// Clean 清理池连接中的闲置连接
-func (p *Pool) Clean() {
-	for {
-		select {
-		case id := <-p.idChan:
-			if conn, ok := p.conns.LoadAndDelete(id); ok {
-				if conn != nil {
-					conn.(net.Conn).Close()
-				}
-			}
-		default:
-			return
-		}
-	}
-}
-
 // Flush 清空连接池中的所有连接
 func (p *Pool) Flush() {
 	var wg sync.WaitGroup
