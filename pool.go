@@ -39,6 +39,7 @@ type Pool struct {
 	tlsConfig *tls.Config              // TLS配置
 	dialer    func() (net.Conn, error) // 创建连接的函数
 	listener  net.Listener             // 监听器
+	first     atomic.Bool              // 首次标志
 	errCount  atomic.Int32             // 错误计数
 	capacity  atomic.Int32             // 当前容量
 	minCap    int                      // 最小容量
@@ -221,11 +222,10 @@ func (p *Pool) handleConnection(conn net.Conn) {
 	}
 
 	// 生成连接ID
-	rawID := make([]byte, 4)
-	if _, err := rand.Read(rawID); err != nil {
+	rawID, id, err := p.generateID()
+	if err != nil {
 		return
 	}
-	id := hex.EncodeToString(rawID)
 
 	// 防止重复连接ID
 	if _, exist := p.conns.Load(id); exist {
@@ -437,4 +437,18 @@ func (p *Pool) adjustCapacity(created int) {
 	if ratio > capacityAdjustHighRatio && capacity < p.maxCap {
 		p.capacity.Add(1)
 	}
+}
+
+// generateID 生成唯一连接ID
+func (p *Pool) generateID() ([]byte, string, error) {
+	if p.first.CompareAndSwap(false, true) {
+		return []byte{0, 0, 0, 0}, "00000000", nil
+	}
+
+	rawID := make([]byte, 4)
+	if _, err := rand.Read(rawID); err != nil {
+		return nil, "", err
+	}
+	id := hex.EncodeToString(rawID)
+	return rawID, id, nil
 }
