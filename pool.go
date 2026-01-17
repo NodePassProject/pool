@@ -1,4 +1,3 @@
-// Package pool 实现了一个高性能、可靠的网络连接池管理系统
 package pool
 
 import (
@@ -29,30 +28,28 @@ const (
 	intervalHighThreshold   = 0.8
 )
 
-// Pool 连接池结构体，用于管理多个网络连接
 type Pool struct {
-	conns     sync.Map                 // 存储连接的映射表
-	idChan    chan string              // 可用ID通道
-	tlsCode   string                   // TLS安全模式代码
-	hostname  string                   // 主机名
-	clientIP  string                   // 客户端IP
-	tlsConfig *tls.Config              // TLS配置
-	dialer    func() (net.Conn, error) // 创建连接的函数
-	listener  net.Listener             // 监听器
-	first     atomic.Bool              // 首次标志
-	errCount  atomic.Int32             // 错误计数
-	capacity  atomic.Int32             // 当前容量
-	minCap    int                      // 最小容量
-	maxCap    int                      // 最大容量
-	interval  atomic.Int64             // 连接创建间隔
-	minIvl    time.Duration            // 最小间隔
-	maxIvl    time.Duration            // 最大间隔
-	keepAlive time.Duration            // 保活间隔
-	ctx       context.Context          // 上下文
-	cancel    context.CancelFunc       // 取消函数
+	conns     sync.Map
+	idChan    chan string
+	tlsCode   string
+	hostname  string
+	clientIP  string
+	tlsConfig *tls.Config
+	dialer    func() (net.Conn, error)
+	listener  net.Listener
+	first     atomic.Bool
+	errCount  atomic.Int32
+	capacity  atomic.Int32
+	minCap    int
+	maxCap    int
+	interval  atomic.Int64
+	minIvl    time.Duration
+	maxIvl    time.Duration
+	keepAlive time.Duration
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
-// NewClientPool 创建新的客户端连接池
 func NewClientPool(
 	minCap, maxCap int,
 	minIvl, maxIvl time.Duration,
@@ -99,7 +96,6 @@ func NewClientPool(
 	return pool
 }
 
-// NewServerPool 创建新的服务端连接池
 func NewServerPool(
 	maxCap int,
 	clientIP string,
@@ -128,7 +124,6 @@ func NewServerPool(
 	return pool
 }
 
-// createConnection 创建新的客户端连接
 func (p *Pool) createConnection() bool {
 	conn, err := p.dialer()
 	if err != nil {
@@ -139,12 +134,9 @@ func (p *Pool) createConnection() bool {
 	conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
 	var id string
-	// 根据TLS代码应用不同级别的TLS安全
 	switch p.tlsCode {
 	case "0":
-		// 不使用TLS
 	case "1":
-		// 使用自签名证书（不验证）
 		tlsConn := tls.Client(conn, &tls.Config{
 			InsecureSkipVerify: true,
 			MinVersion:         tls.VersionTLS13,
@@ -155,7 +147,6 @@ func (p *Pool) createConnection() bool {
 		}
 		conn = tlsConn
 	case "2":
-		// 使用验证证书（安全模式）
 		tlsConn := tls.Client(conn, &tls.Config{
 			InsecureSkipVerify: false,
 			MinVersion:         tls.VersionTLS13,
@@ -168,7 +159,6 @@ func (p *Pool) createConnection() bool {
 		conn = tlsConn
 	}
 
-	// 接收连接ID
 	conn.SetReadDeadline(time.Now().Add(idReadTimeout))
 	buf := make([]byte, 4)
 	n, err := io.ReadFull(conn, buf)
@@ -179,7 +169,6 @@ func (p *Pool) createConnection() bool {
 	id = hex.EncodeToString(buf)
 	conn.SetReadDeadline(time.Time{})
 
-	// 建立映射并存入通道
 	p.conns.Store(id, conn)
 	select {
 	case p.idChan <- id:
@@ -191,7 +180,6 @@ func (p *Pool) createConnection() bool {
 	}
 }
 
-// handleConnection 处理新的服务端连接
 func (p *Pool) handleConnection(conn net.Conn) {
 	defer func() {
 		if conn != nil {
@@ -199,7 +187,6 @@ func (p *Pool) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	// 检查池是否已满
 	if p.Active() >= p.maxCap {
 		return
 	}
@@ -207,12 +194,10 @@ func (p *Pool) handleConnection(conn net.Conn) {
 	conn.(*net.TCPConn).SetKeepAlive(true)
 	conn.(*net.TCPConn).SetKeepAlivePeriod(p.keepAlive)
 
-	// 验证客户端IP
 	if p.clientIP != "" && conn.RemoteAddr().(*net.TCPAddr).IP.String() != p.clientIP {
 		return
 	}
 
-	// 应用TLS
 	if p.tlsConfig != nil {
 		tlsConn := tls.Server(conn, p.tlsConfig)
 		if err := tlsConn.Handshake(); err != nil {
@@ -221,34 +206,28 @@ func (p *Pool) handleConnection(conn net.Conn) {
 		conn = tlsConn
 	}
 
-	// 生成连接ID
 	rawID, id, err := p.generateID()
 	if err != nil {
 		return
 	}
 
-	// 防止重复连接ID
 	if _, exist := p.conns.Load(id); exist {
 		return
 	}
 
-	// 发送ID给客户端并在成功后建立映射
 	if _, err := conn.Write(rawID); err != nil {
 		return
 	}
 
-	// 尝试放入idChan
 	select {
 	case p.idChan <- id:
 		p.conns.Store(id, conn)
 		conn = nil
 	default:
-		// 池满
 		return
 	}
 }
 
-// ClientManager 客户端连接池管理器
 func (p *Pool) ClientManager() {
 	if p.cancel != nil {
 		p.cancel()
@@ -288,7 +267,6 @@ func (p *Pool) ClientManager() {
 	}
 }
 
-// ServerManager 服务端连接池管理器
 func (p *Pool) ServerManager() {
 	if p.cancel != nil {
 		p.cancel()
@@ -314,7 +292,6 @@ func (p *Pool) ServerManager() {
 	}
 }
 
-// OutgoingGet 根据ID获取可用池连接
 func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
@@ -331,7 +308,6 @@ func (p *Pool) OutgoingGet(id string, timeout time.Duration) (net.Conn, error) {
 	}
 }
 
-// IncomingGet 获取可用池连接返回ID
 func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	ctx, cancel := context.WithTimeout(p.ctx, timeout)
 	defer cancel()
@@ -348,7 +324,6 @@ func (p *Pool) IncomingGet(timeout time.Duration) (string, net.Conn, error) {
 	}
 }
 
-// Flush 清空连接池中的所有连接
 func (p *Pool) Flush() {
 	var wg sync.WaitGroup
 	p.conns.Range(func(key, value any) bool {
@@ -365,7 +340,6 @@ func (p *Pool) Flush() {
 	p.idChan = make(chan string, p.maxCap)
 }
 
-// Close 关闭连接池并释放资源
 func (p *Pool) Close() {
 	if p.cancel != nil {
 		p.cancel()
@@ -373,42 +347,34 @@ func (p *Pool) Close() {
 	p.Flush()
 }
 
-// Ready 检查连接池是否已初始化
 func (p *Pool) Ready() bool {
 	return p.ctx != nil
 }
 
-// Active 获取当前活跃连接数
 func (p *Pool) Active() int {
 	return len(p.idChan)
 }
 
-// Capacity 获取当前连接池容量
 func (p *Pool) Capacity() int {
 	return int(p.capacity.Load())
 }
 
-// Interval 获取当前连接创建间隔
 func (p *Pool) Interval() time.Duration {
 	return time.Duration(p.interval.Load())
 }
 
-// AddError 增加错误计数
 func (p *Pool) AddError() {
 	p.errCount.Add(1)
 }
 
-// ErrorCount 获取错误计数
 func (p *Pool) ErrorCount() int {
 	return int(p.errCount.Load())
 }
 
-// ResetError 重置错误计数
 func (p *Pool) ResetError() {
 	p.errCount.Store(0)
 }
 
-// adjustInterval 根据连接池使用情况动态调整连接创建间隔
 func (p *Pool) adjustInterval() {
 	idle := len(p.idChan)
 	capacity := int(p.capacity.Load())
@@ -425,7 +391,6 @@ func (p *Pool) adjustInterval() {
 	}
 }
 
-// adjustCapacity 根据创建成功率动态调整连接池容量
 func (p *Pool) adjustCapacity(created int) {
 	capacity := int(p.capacity.Load())
 	ratio := float64(created) / float64(capacity)
@@ -439,7 +404,6 @@ func (p *Pool) adjustCapacity(created int) {
 	}
 }
 
-// generateID 生成唯一连接ID
 func (p *Pool) generateID() ([]byte, string, error) {
 	if p.first.CompareAndSwap(false, true) {
 		return []byte{0, 0, 0, 0}, "00000000", nil
